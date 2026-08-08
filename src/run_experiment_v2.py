@@ -1,14 +1,12 @@
-"""Extension experiments for the MCMC sampling project.
+"""Experiments for the MCMC sampling study.
 
-This script adds the pieces the first round did not cover:
-  1. A reliable effective-sample-size estimator (Geyer initial monotone positive sequence)
-     and split R-hat, replacing diagnostics that saturated at the chain length.
-  2. An adaptive, preconditioned Metropolis-Hastings sampler that repairs the efficiency
-     collapse caused by the anisotropic posterior.
-  3. Validation against PyMC / NUTS, an established probabilistic programming library.
-  4. A residual analysis that identifies the true cause of the interval over-coverage, and a
-     robust Student-t regression sampled with a scale-mixture Gibbs sampler that repairs it.
-  5. A sensitivity study of the effect of the starting point on convergence.
+Pipeline: load the Bitbrains traces, build a one-step-ahead forecasting design, split it
+chronologically into train / validation / test, run five samplers against the Gaussian posterior
+and a Student-t model selected on validation, diagnose convergence, validate against an analytical
+reference and an external library, and write every number to experiment_results_v2.json.
+
+Run with --skip-nuts to omit the optional PyMC cross-check, which is impractically slow on a
+machine without a C++ compiler. Nothing else depends on it.
 """
 import glob
 import json
@@ -22,17 +20,13 @@ import pandas as pd
 os.environ.setdefault('PYTENSOR_FLAGS', 'cxx=')
 sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
-PROJECT_ROOT_DIRECTORY = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRACE_DATA_DIRECTORY = os.path.join(PROJECT_ROOT_DIRECTORY, 'data', 'fastStorage', '2013-8')
-RESULTS_DIRECTORY = os.path.join(PROJECT_ROOT_DIRECTORY, 'results')
-FIGURES_DIRECTORY = os.path.join(RESULTS_DIRECTORY, 'figures')
-RESULTS_FILE_PATH = os.path.join(RESULTS_DIRECTORY, 'experiment_results_v2.json')
-os.makedirs(FIGURES_DIRECTORY, exist_ok=True)
-
-
-def figure_path(figure_filename):
-    """Absolute path of a figure inside results/figures, so the script runs from any directory."""
-    return os.path.join(FIGURES_DIRECTORY, figure_filename)
+SOURCE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+REPOSITORY_ROOT = os.path.dirname(SOURCE_DIRECTORY)     if os.path.isdir(os.path.join(os.path.dirname(SOURCE_DIRECTORY), 'data')) else SOURCE_DIRECTORY
+DATA_DIRECTORY = os.path.join(REPOSITORY_ROOT, 'data', 'fastStorage', '2013-8')
+RESULTS_DIRECTORY = os.path.join(REPOSITORY_ROOT, 'results')
+FIGURE_DIRECTORY = os.path.join(RESULTS_DIRECTORY, 'figures')
+RESULTS_FILE = os.path.join(RESULTS_DIRECTORY, 'experiment_results_v2.json')
+os.makedirs(FIGURE_DIRECTORY, exist_ok=True)
 
 
 import matplotlib
@@ -41,159 +35,132 @@ import matplotlib.pyplot as plt
 from scipy import stats
 from scipy.special import gammaln
 
+from mcmc_diagnostics import (bulk_effective_sample_size, cross_check_against_arviz,
+                              maximum_rhat, monte_carlo_standard_error,
+                              tail_effective_sample_size)
+
 plt.rcParams.update({'figure.figsize': (12, 6), 'font.size': 12, 'axes.grid': True,
                      'grid.alpha': 0.3})
+
+
+def save_figure(filename):
+    plt.savefig(os.path.join(FIGURE_DIRECTORY, filename), dpi=150, bbox_inches='tight')
+    plt.close()
 
 TELEMETRY_COLUMNS = ['Timestamp', 'CPU_Cores', 'CPU_Capacity_MHz', 'CPU_Usage_MHz', 'CPU_Usage_Pct',
                      'Mem_Provisioned_KB', 'Mem_Usage_KB', 'Disk_Read_KBps', 'Disk_Write_KBps',
                      'Net_Recv_KBps', 'Net_Trans_KBps']
 VIRTUAL_MACHINE_COUNT = 50
 MAXIMUM_OBSERVATIONS = 5000
-TRAINING_FRACTION = 0.7
+TRAIN_FRACTION = 0.60
+VALIDATION_FRACTION = 0.20
+SAMPLING_INTERVAL_MINUTES = 5
+FORECAST_HORIZON_STEPS = 1
+FEATURE_WINDOW_STEPS = 6
 COEFFICIENT_PRIOR_VARIANCE = 10.0
 VARIANCE_PRIOR_SHAPE = 2.0
-VARIANCE_PRIOR_SCALE = 1.0
-POSTERIOR_SAMPLE_COUNT = 10000
-BURN_IN_COUNT = 2000
-CHAIN_COUNT = 3
-STUDENT_T_DEGREES_OF_FREEDOM = 4.0
-NUTS_DRAW_COUNT = 500
-NUTS_TUNE_COUNT = 500
+VARIANCE_PRIOR_RATE = 1.0
+POSTERIOR_DRAWS = 10000
+BURN_IN_DRAWS = 2000
+CHAIN_COUNT = 4
+REPEAT_COUNT = 3
+LONG_RUN_DRAWS = 40000
 PREDICTIVE_DRAW_COUNT = 2000
+STUDENT_T_GRID = [2.0, 3.0, 4.0, 6.0, 10.0, 20.0]
+RHAT_THRESHOLD = 1.01
+BULK_ESS_THRESHOLD = 400.0
+BOOTSTRAP_BLOCK_LENGTH = 50
+BOOTSTRAP_REPLICATES = 2000
+GAUSSIAN_SAMPLERS = ['MH', 'Adaptive MH (naive)', 'Preconditioned MH', 'Gibbs', 'HMC']
 METHOD_COLORS = {'MH': 'steelblue', 'Adaptive MH (naive)': 'firebrick',
-                 'Preconditioned MH': 'darkorange', 'Gibbs': 'coral', 'HMC': 'seagreen',
-                 'NUTS (PyMC)': 'purple'}
-METHOD_ORDER = ['MH', 'Adaptive MH (naive)', 'Preconditioned MH', 'Gibbs', 'HMC', 'NUTS (PyMC)']
+                 'Preconditioned MH': 'darkorange', 'Gibbs': 'coral', 'HMC': 'seagreen'}
+REPORTED_PARAMETERS = [('Intercept', 0), ('beta_1', 1), ('beta_3', 3)]
 
+
+# --------------------------------------------------------------------------------------------
+# Data
+# --------------------------------------------------------------------------------------------
 
 def load_and_prepare_data():
-    csv_paths = sorted(glob.glob(os.path.join(TRACE_DATA_DIRECTORY,
-                                              '*.csv')))[:VIRTUAL_MACHINE_COUNT]
-    per_machine_frames = []
+    """Build a one-step-ahead forecasting design with a leakage-safe chronological split.
+
+    Every predictor is lagged so that it is observable at the time the forecast is issued: the
+    target is CPU usage at time t and all features are functions of information up to t-1. The
+    horizon is therefore one sampling interval, five minutes.
+    """
+    csv_paths = sorted(glob.glob(os.path.join(DATA_DIRECTORY, '*.csv')))
+    csv_paths = csv_paths[:VIRTUAL_MACHINE_COUNT]
+    per_machine = []
     for csv_path in csv_paths:
-        machine_frame = pd.read_csv(csv_path, sep=';\t', header=0, engine='python')
-        machine_frame.columns = TELEMETRY_COLUMNS
-        machine_frame['VM_ID'] = os.path.basename(csv_path).replace('.csv', '')
-        per_machine_frames.append(machine_frame)
-    combined_frame = pd.concat(per_machine_frames, ignore_index=True)
-    combined_frame['Datetime'] = pd.to_datetime(combined_frame['Timestamp'], unit='s')
-    engineered_frames = []
-    for machine_identifier in combined_frame['VM_ID'].unique():
-        machine_data = combined_frame[combined_frame['VM_ID'] == machine_identifier]
-        if len(machine_data) < 50:
+        frame = pd.read_csv(csv_path, sep=';\t', header=0, engine='python')
+        frame.columns = TELEMETRY_COLUMNS
+        frame['VM_ID'] = os.path.basename(csv_path).replace('.csv', '')
+        per_machine.append(frame)
+    combined = pd.concat(per_machine, ignore_index=True)
+    combined['Datetime'] = pd.to_datetime(combined['Timestamp'], unit='s')
+    exogenous_columns = ['Mem_Usage_KB', 'Disk_Read_KBps', 'Disk_Write_KBps', 'Net_Recv_KBps',
+                         'Net_Trans_KBps']
+    engineered = []
+    for machine_identifier in combined['VM_ID'].unique():
+        frame = combined[combined['VM_ID'] == machine_identifier].sort_values('Datetime').copy()
+        if len(frame) < 50:
             continue
-        frame = machine_data.sort_values('Datetime').copy()
-        for lag_length in [1, 2, 3]:
-            frame['CPU_lag_%d' % lag_length] = frame['CPU_Usage_Pct'].shift(lag_length)
-        frame['CPU_rolling_mean'] = frame['CPU_Usage_Pct'].shift(1).rolling(window=6).mean()
-        frame['CPU_rolling_std'] = frame['CPU_Usage_Pct'].shift(1).rolling(window=6).std()
-        engineered_frames.append(frame.dropna().reset_index(drop=True))
-    features_frame = pd.concat(engineered_frames, ignore_index=True)
+        for column in exogenous_columns:
+            frame['%s_lag1' % column] = frame[column].shift(FORECAST_HORIZON_STEPS)
+        for lag in [1, 2, 3]:
+            frame['CPU_lag_%d' % lag] = frame['CPU_Usage_Pct'].shift(lag)
+        frame['CPU_rolling_mean'] = frame['CPU_Usage_Pct'].shift(1).rolling(
+            window=FEATURE_WINDOW_STEPS).mean()
+        frame['CPU_rolling_std'] = frame['CPU_Usage_Pct'].shift(1).rolling(
+            window=FEATURE_WINDOW_STEPS).std()
+        frame['earliest_information_time'] = frame['Datetime'].shift(FEATURE_WINDOW_STEPS)
+        engineered.append(frame.dropna().reset_index(drop=True))
+    features_frame = pd.concat(engineered, ignore_index=True)
     features_frame = features_frame.sort_values('Datetime').reset_index(drop=True)
     features_frame = features_frame.iloc[:MAXIMUM_OBSERVATIONS].reset_index(drop=True)
-    predictor_names = (['Mem_Usage_KB', 'Disk_Read_KBps', 'Disk_Write_KBps', 'Net_Recv_KBps',
-                        'Net_Trans_KBps'] + ['CPU_lag_%d' % i for i in [1, 2, 3]]
+    predictor_names = (['%s_lag1' % column for column in exogenous_columns]
+                       + ['CPU_lag_%d' % lag for lag in [1, 2, 3]]
                        + ['CPU_rolling_mean', 'CPU_rolling_std'])
+    observation_count = len(features_frame)
+    train_end = int(TRAIN_FRACTION * observation_count)
+    validation_end = int((TRAIN_FRACTION + VALIDATION_FRACTION) * observation_count)
+    train_boundary_time = features_frame['Datetime'].iloc[train_end - 1]
+    validation_boundary_time = features_frame['Datetime'].iloc[validation_end - 1]
+    earliest = features_frame['earliest_information_time']
+    split_labels = np.array(['train'] * observation_count, dtype=object)
+    split_labels[train_end:validation_end] = 'validation'
+    split_labels[validation_end:] = 'test'
+    embargoed = np.zeros(observation_count, dtype=bool)
+    embargoed[train_end:validation_end] = earliest.iloc[train_end:validation_end] \
+        <= train_boundary_time
+    embargoed[validation_end:] = earliest.iloc[validation_end:] <= validation_boundary_time
     raw_predictors = features_frame[predictor_names].values
     raw_target = features_frame['CPU_Usage_Pct'].values
-    predictor_standard_deviations = raw_predictors.std(axis=0)
-    predictor_standard_deviations[predictor_standard_deviations == 0] = 1.0
-    scaled_predictors = (raw_predictors - raw_predictors.mean(axis=0)) / predictor_standard_deviations
-    target_standard_deviation = raw_target.std() or 1.0
-    scaled_target = (raw_target - raw_target.mean()) / target_standard_deviation
-    design_matrix = np.column_stack([np.ones(len(scaled_predictors)), scaled_predictors])
-    split_index = int(TRAINING_FRACTION * len(scaled_target))
-    return {'train_design': design_matrix[:split_index], 'test_design': design_matrix[split_index:],
-            'train_target': scaled_target[:split_index], 'test_target': scaled_target[split_index:],
-            'predictor_names': predictor_names}
+    train_mask = (split_labels == 'train') & ~embargoed
+    predictor_mean = raw_predictors[train_mask].mean(axis=0)
+    predictor_std = raw_predictors[train_mask].std(axis=0)
+    predictor_std[predictor_std == 0] = 1.0
+    target_mean = float(raw_target[train_mask].mean())
+    target_std = float(raw_target[train_mask].std()) or 1.0
+    scaled_predictors = (raw_predictors - predictor_mean) / predictor_std
+    scaled_target = (raw_target - target_mean) / target_std
+    design_matrix = np.column_stack([np.ones(observation_count), scaled_predictors])
+    splits = {}
+    for split_name in ('train', 'validation', 'test'):
+        mask = (split_labels == split_name) & ~embargoed
+        splits[split_name] = {'design': design_matrix[mask], 'target': scaled_target[mask],
+                              'machine': features_frame['VM_ID'].values[mask],
+                              'time': features_frame['Datetime'].values[mask]}
+    return {'splits': splits, 'predictor_names': predictor_names, 'target_std': target_std,
+            'target_mean': target_mean, 'embargoed_count': int(embargoed.sum()),
+            'total_available': int(len(combined)),
+            'distinct_machines': int(features_frame['VM_ID'].nunique()),
+            'horizon_minutes': FORECAST_HORIZON_STEPS * SAMPLING_INTERVAL_MINUTES}
 
 
-def autocorrelation_function(chain):
-    chain_length = len(chain)
-    centered_chain = chain - chain.mean()
-    padded_length = 1
-    while padded_length < 2 * chain_length:
-        padded_length *= 2
-    frequency_domain = np.fft.rfft(centered_chain, padded_length)
-    autocovariance = np.fft.irfft(frequency_domain * np.conjugate(frequency_domain),
-                                  padded_length)[:chain_length]
-    autocovariance /= np.arange(chain_length, 0, -1)
-    if autocovariance[0] <= 0:
-        return np.zeros(chain_length)
-    return autocovariance / autocovariance[0]
-
-
-def effective_sample_size(chain):
-    """Geyer initial monotone positive sequence estimator.
-
-    The pairwise sums of successive autocorrelations are provably positive and decreasing for
-    a reversible chain, so truncating at the first non-positive pair removes the noise floor
-    that makes naive threshold estimators report the full chain length for any good sampler.
-    """
-    chain = np.asarray(chain, dtype=np.float64)
-    chain_length = len(chain)
-    if np.var(chain) == 0:
-        return 0.0
-    autocorrelations = autocorrelation_function(chain)
-    maximum_pair_count = (chain_length - 1) // 2
-    pair_sums = autocorrelations[1:2 * maximum_pair_count + 1:2] \
-        + autocorrelations[2:2 * maximum_pair_count + 2:2]
-    positive_pair_count = np.argmax(pair_sums <= 0) if np.any(pair_sums <= 0) else len(pair_sums)
-    if positive_pair_count == 0:
-        return float(chain_length)
-    retained_pairs = np.minimum.accumulate(pair_sums[:positive_pair_count])
-    integrated_autocorrelation_time = max(-1.0 + 2.0 * retained_pairs.sum(), 1.0)
-    return float(min(chain_length, chain_length / integrated_autocorrelation_time))
-
-
-def split_potential_scale_reduction(chains):
-    """Split R-hat: each chain is halved so that within-chain drift inflates the statistic."""
-    split_chains = []
-    for chain in chains:
-        half_length = len(chain) // 2
-        split_chains.append(np.asarray(chain[:half_length], dtype=np.float64))
-        split_chains.append(np.asarray(chain[half_length:2 * half_length], dtype=np.float64))
-    chain_count = len(split_chains)
-    chain_length = len(split_chains[0])
-    chain_means = np.array([segment.mean() for segment in split_chains])
-    chain_variances = np.array([segment.var(ddof=1) for segment in split_chains])
-    within_chain_variance = chain_variances.mean()
-    if within_chain_variance <= 0:
-        return float('inf')
-    between_chain_variance = chain_length * chain_means.var(ddof=1)
-    pooled_variance = (chain_length - 1) / chain_length * within_chain_variance \
-        + between_chain_variance / chain_length
-    return float(np.sqrt(pooled_variance / within_chain_variance))
-
-
-def plain_potential_scale_reduction(chains):
-    """The original, unsplit Gelman-Rubin statistic, retained for comparison with split R-hat."""
-    chain_count = len(chains)
-    chain_length = len(chains[0])
-    chain_means = np.array([np.mean(chain) for chain in chains])
-    within_chain_variance = np.mean([np.var(chain, ddof=1) for chain in chains])
-    if within_chain_variance <= 0:
-        return float('inf')
-    between_chain_variance = chain_length / (chain_count - 1) \
-        * np.sum((chain_means - chain_means.mean()) ** 2)
-    pooled_variance = (1 - 1 / chain_length) * within_chain_variance \
-        + between_chain_variance / chain_length
-    return float(np.sqrt(pooled_variance / within_chain_variance))
-
-
-def monte_carlo_standard_error(chains):
-    pooled_chain = np.concatenate(chains)
-    per_chain_effective_sizes = sum(effective_sample_size(chain) for chain in chains)
-    if per_chain_effective_sizes <= 0:
-        return float('nan')
-    return float(np.std(pooled_chain, ddof=1) / np.sqrt(per_chain_effective_sizes))
-
-
-def log_likelihood_gaussian(coefficients, noise_variance, design, target):
-    residuals = target - design @ coefficients
-    return -0.5 * len(target) * np.log(2 * np.pi * noise_variance) \
-        - 0.5 * np.sum(residuals ** 2) / noise_variance
-
+# --------------------------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------------------------
 
 def log_prior_coefficients(coefficients):
     return -0.5 * len(coefficients) * np.log(2 * np.pi * COEFFICIENT_PRIOR_VARIANCE) \
@@ -203,23 +170,32 @@ def log_prior_coefficients(coefficients):
 def log_prior_noise_variance(noise_variance):
     if noise_variance <= 0:
         return -np.inf
-    return VARIANCE_PRIOR_SHAPE * np.log(VARIANCE_PRIOR_SCALE) - gammaln(VARIANCE_PRIOR_SHAPE) \
-        - (VARIANCE_PRIOR_SHAPE + 1) * np.log(noise_variance) - VARIANCE_PRIOR_SCALE / noise_variance
+    return VARIANCE_PRIOR_SHAPE * np.log(VARIANCE_PRIOR_RATE) - gammaln(VARIANCE_PRIOR_SHAPE) \
+        - (VARIANCE_PRIOR_SHAPE + 1) * np.log(noise_variance) - VARIANCE_PRIOR_RATE / noise_variance
 
 
 def log_posterior(coefficients, noise_variance, design, target):
-    variance_prior_term = log_prior_noise_variance(noise_variance)
-    if np.isinf(variance_prior_term):
+    prior_term = log_prior_noise_variance(noise_variance)
+    if np.isinf(prior_term):
         return -np.inf
-    return log_likelihood_gaussian(coefficients, noise_variance, design, target) \
-        + log_prior_coefficients(coefficients) + variance_prior_term
+    residuals = target - design @ coefficients
+    log_likelihood = -0.5 * len(target) * np.log(2 * np.pi * noise_variance) \
+        - 0.5 * np.sum(residuals ** 2) / noise_variance
+    return log_likelihood + log_prior_coefficients(coefficients) + prior_term
 
 
 def log_posterior_unconstrained(parameter_vector, design, target):
+    """Log posterior in the unconstrained parameterisation psi = log(sigma^2).
+
+    The change of variables sigma^2 = exp(psi) contributes a Jacobian |d sigma^2 / d psi| =
+    exp(psi) = sigma^2, so log(sigma^2) is added. Every sampler that works on the unconstrained
+    scale (MH, both adaptive variants, HMC, emcee) uses this function.
+    """
     coefficient_count = design.shape[1]
-    noise_variance = np.exp(parameter_vector[coefficient_count])
-    return log_posterior(parameter_vector[:coefficient_count], noise_variance, design, target) \
-        + parameter_vector[coefficient_count]
+    log_variance = parameter_vector[coefficient_count]
+    noise_variance = np.exp(log_variance)
+    return log_posterior(parameter_vector[:coefficient_count], noise_variance, design,
+                         target) + log_variance
 
 
 def gradient_log_posterior_unconstrained(parameter_vector, design, target):
@@ -230,816 +206,1187 @@ def gradient_log_posterior_unconstrained(parameter_vector, design, target):
     coefficient_gradient = (design.T @ residuals) / noise_variance \
         - coefficients / COEFFICIENT_PRIOR_VARIANCE
     log_variance_gradient = -0.5 * len(target) + 0.5 * np.sum(residuals ** 2) / noise_variance \
-        - (VARIANCE_PRIOR_SHAPE + 1) + VARIANCE_PRIOR_SCALE / noise_variance + 1
+        - (VARIANCE_PRIOR_SHAPE + 1) + VARIANCE_PRIOR_RATE / noise_variance + 1
     return np.concatenate([coefficient_gradient, [log_variance_gradient]])
 
 
-def metropolis_hastings(design, target, sample_count, burn_in, coefficient_step=0.001,
-                        log_variance_step=0.05, random_seed=0, initial_parameters=None):
-    generator = np.random.default_rng(random_seed)
-    coefficient_count = design.shape[1]
-    parameter_vector = np.zeros(coefficient_count + 1) if initial_parameters is None \
-        else initial_parameters.copy()
-    proposal_scales = np.concatenate([np.full(coefficient_count, coefficient_step),
-                                      [log_variance_step]])
-    current_log_posterior = log_posterior_unconstrained(parameter_vector, design, target)
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    variance_samples = np.zeros(sample_count)
-    log_posterior_trace = np.zeros(sample_count + burn_in)
-    accepted_count = 0
-    for iteration_index in range(sample_count + burn_in):
-        proposed_vector = parameter_vector + generator.normal(0, proposal_scales)
-        proposed_log_posterior = log_posterior_unconstrained(proposed_vector, design, target)
-        if np.log(generator.uniform()) < proposed_log_posterior - current_log_posterior:
-            parameter_vector = proposed_vector
-            current_log_posterior = proposed_log_posterior
-            if iteration_index >= burn_in:
-                accepted_count += 1
-        log_posterior_trace[iteration_index] = current_log_posterior
-        if iteration_index >= burn_in:
-            coefficient_samples[iteration_index - burn_in] = parameter_vector[:coefficient_count]
-            variance_samples[iteration_index - burn_in] = np.exp(parameter_vector[coefficient_count])
-    return {'coefficients': coefficient_samples, 'variances': variance_samples,
-            'acceptance_rate': accepted_count / sample_count, 'log_posterior': log_posterior_trace}
+def dispersed_starting_point(dimension, random_seed):
+    """Overdispersed relative to the posterior, as split R-hat assumes."""
+    generator = np.random.default_rng(10_000 + random_seed)
+    coefficients = generator.normal(0.0, 2.0, size=dimension - 1)
+    log_variance = generator.normal(0.0, 1.5)
+    return np.concatenate([coefficients, [log_variance]])
 
 
-def adaptive_metropolis_hastings(design, target, sample_count, burn_in, random_seed=0,
-                                 adaptation_interval=200, initial_parameters=None):
-    """Haario adaptive Metropolis: the proposal covariance is learned during burn-in only.
+# --------------------------------------------------------------------------------------------
+# Samplers
+# --------------------------------------------------------------------------------------------
 
-    Freezing the covariance at the end of burn-in keeps the retained samples a homogeneous
-    Markov chain, so the usual convergence guarantees apply without appealing to diminishing
-    adaptation results.
-    """
+def metropolis_hastings(design, target, draws, burn_in, random_seed=0, initial_parameters=None,
+                        coefficient_step=0.001, log_variance_step=0.05):
     generator = np.random.default_rng(random_seed)
     coefficient_count = design.shape[1]
     dimension = coefficient_count + 1
-    parameter_vector = np.zeros(dimension) if initial_parameters is None \
+    parameters = dispersed_starting_point(dimension, random_seed) if initial_parameters is None \
         else initial_parameters.copy()
-    scaling_constant = 2.38 ** 2 / dimension
-    regularization = 1e-10 * np.eye(dimension)
-    proposal_covariance = np.diag(np.concatenate([np.full(coefficient_count, 0.001 ** 2), [0.05 ** 2]]))
-    proposal_cholesky = np.linalg.cholesky(proposal_covariance)
-    current_log_posterior = log_posterior_unconstrained(parameter_vector, design, target)
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    variance_samples = np.zeros(sample_count)
-    log_posterior_trace = np.zeros(sample_count + burn_in)
-    burn_in_history = np.zeros((burn_in, dimension))
-    accepted_count = 0
-    for iteration_index in range(sample_count + burn_in):
-        proposed_vector = parameter_vector + proposal_cholesky @ generator.normal(size=dimension)
-        proposed_log_posterior = log_posterior_unconstrained(proposed_vector, design, target)
-        if np.log(generator.uniform()) < proposed_log_posterior - current_log_posterior:
-            parameter_vector = proposed_vector
-            current_log_posterior = proposed_log_posterior
-            if iteration_index >= burn_in:
-                accepted_count += 1
-        log_posterior_trace[iteration_index] = current_log_posterior
-        if iteration_index < burn_in:
-            burn_in_history[iteration_index] = parameter_vector
-            if (iteration_index + 1) % adaptation_interval == 0 and iteration_index > dimension * 2:
-                empirical_covariance = np.cov(burn_in_history[:iteration_index + 1].T)
-                proposal_covariance = scaling_constant * empirical_covariance + regularization
+    scales = np.concatenate([np.full(coefficient_count, coefficient_step), [log_variance_step]])
+    current = log_posterior_unconstrained(parameters, design, target)
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    variance_draws = np.zeros(draws)
+    trace = np.zeros(draws + burn_in)
+    accepted = 0
+    for index in range(draws + burn_in):
+        proposal = parameters + generator.normal(0, scales)
+        proposed = log_posterior_unconstrained(proposal, design, target)
+        if np.log(generator.uniform()) < proposed - current:
+            parameters, current = proposal, proposed
+            if index >= burn_in:
+                accepted += 1
+        trace[index] = current
+        if index >= burn_in:
+            coefficient_draws[index - burn_in] = parameters[:coefficient_count]
+            variance_draws[index - burn_in] = np.exp(parameters[coefficient_count])
+    return {'coefficients': coefficient_draws, 'variances': variance_draws,
+            'acceptance_rate': accepted / draws, 'log_posterior': trace,
+            'gradient_evaluations': 0, 'density_evaluations': draws + burn_in}
+
+
+def adaptive_metropolis_hastings(design, target, draws, burn_in, random_seed=0,
+                                 initial_parameters=None, adaptation_interval=200):
+    """Haario-style adaptive Metropolis: proposal covariance estimated from the chain history."""
+    generator = np.random.default_rng(random_seed)
+    coefficient_count = design.shape[1]
+    dimension = coefficient_count + 1
+    parameters = dispersed_starting_point(dimension, random_seed) if initial_parameters is None \
+        else initial_parameters.copy()
+    scaling = 2.38 ** 2 / dimension
+    covariance = np.diag(np.concatenate([np.full(coefficient_count, 0.001 ** 2), [0.05 ** 2]]))
+    cholesky = np.linalg.cholesky(covariance)
+    current = log_posterior_unconstrained(parameters, design, target)
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    variance_draws = np.zeros(draws)
+    trace = np.zeros(draws + burn_in)
+    history = np.zeros((burn_in, dimension))
+    accepted = 0
+    for index in range(draws + burn_in):
+        proposal = parameters + cholesky @ generator.normal(size=dimension)
+        proposed = log_posterior_unconstrained(proposal, design, target)
+        if np.log(generator.uniform()) < proposed - current:
+            parameters, current = proposal, proposed
+            if index >= burn_in:
+                accepted += 1
+        trace[index] = current
+        if index < burn_in:
+            history[index] = parameters
+            if (index + 1) % adaptation_interval == 0 and index > 2 * dimension:
+                empirical = np.cov(history[:index + 1].T)
                 try:
-                    proposal_cholesky = np.linalg.cholesky(proposal_covariance)
+                    cholesky = np.linalg.cholesky(scaling * empirical
+                                                  + 1e-10 * np.eye(dimension))
                 except np.linalg.LinAlgError:
                     pass
         else:
-            coefficient_samples[iteration_index - burn_in] = parameter_vector[:coefficient_count]
-            variance_samples[iteration_index - burn_in] = np.exp(parameter_vector[coefficient_count])
-    return {'coefficients': coefficient_samples, 'variances': variance_samples,
-            'acceptance_rate': accepted_count / sample_count, 'log_posterior': log_posterior_trace,
-            'proposal_covariance': proposal_covariance}
+            coefficient_draws[index - burn_in] = parameters[:coefficient_count]
+            variance_draws[index - burn_in] = np.exp(parameters[coefficient_count])
+    return {'coefficients': coefficient_draws, 'variances': variance_draws,
+            'acceptance_rate': accepted / draws, 'log_posterior': trace,
+            'gradient_evaluations': 0, 'density_evaluations': draws + burn_in}
 
 
-def preconditioned_metropolis_hastings(design, target, sample_count, burn_in, random_seed=0,
-                                       adaptation_interval=100, initial_parameters=None,
+def preconditioned_metropolis_hastings(design, target, draws, burn_in, random_seed=0,
+                                       initial_parameters=None, adaptation_interval=100,
                                        target_acceptance=0.234):
-    """Metropolis-Hastings preconditioned by the observed Fisher information.
+    """Metropolis preconditioned by the observed Fisher information.
 
-    Estimating the proposal covariance purely from the chain's own history fails here: the
-    unpreconditioned chain barely moves during burn-in, so the empirical covariance describes
-    its transient drift rather than the posterior. We therefore start from an analytic
-    preconditioner available from a single least-squares fit, which requires no conjugacy, and
-    refine it during burn-in while a Robbins-Monro rule tunes a global scale toward the optimal
-    acceptance rate. Both adaptations stop before the retained samples are collected.
+    The metric is the Gaussian approximation to the posterior covariance of beta,
+        (X'X / sigmahat^2 + I / tau^2)^-1  =  sigmahat^2 (X'X + sigmahat^2 I / tau^2)^-1,
+    evaluated at the least-squares residual variance. It follows from one least-squares fit and
+    does not require conjugacy. A Robbins-Monro rule tunes a global scale toward the optimal
+    acceptance rate, and the empirical covariance of the post-transient burn-in refines the
+    metric. Both adaptations are frozen before the retained draws begin, so the retained chain is
+    a homogeneous Markov chain.
     """
     generator = np.random.default_rng(random_seed)
     observation_count, coefficient_count = design.shape
     dimension = coefficient_count + 1
-    least_squares_coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
-    residual_variance = float(np.mean((target - design @ least_squares_coefficients) ** 2))
+    least_squares = np.linalg.lstsq(design, target, rcond=None)[0]
+    residual_variance = float(np.mean((target - design @ least_squares) ** 2))
     coefficient_covariance = residual_variance * np.linalg.inv(
-        design.T @ design + np.eye(coefficient_count) / COEFFICIENT_PRIOR_VARIANCE)
+        design.T @ design + residual_variance * np.eye(coefficient_count)
+        / COEFFICIENT_PRIOR_VARIANCE)
     base_covariance = np.zeros((dimension, dimension))
     base_covariance[:coefficient_count, :coefficient_count] = coefficient_covariance
     base_covariance[coefficient_count, coefficient_count] = 2.0 / observation_count
-    optimal_scaling = 2.38 ** 2 / dimension
+    scaling = 2.38 ** 2 / dimension
     log_scale = 0.0
     base_cholesky = np.linalg.cholesky(base_covariance)
-    proposal_cholesky = np.exp(log_scale) * np.sqrt(optimal_scaling) * base_cholesky
-    parameter_vector = np.zeros(dimension) if initial_parameters is None \
+    cholesky = np.exp(log_scale) * np.sqrt(scaling) * base_cholesky
+    parameters = dispersed_starting_point(dimension, random_seed) if initial_parameters is None \
         else initial_parameters.copy()
-    current_log_posterior = log_posterior_unconstrained(parameter_vector, design, target)
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    variance_samples = np.zeros(sample_count)
-    log_posterior_trace = np.zeros(sample_count + burn_in)
-    burn_in_history = np.zeros((burn_in, dimension))
-    accepted_count = 0
-    transient_length = burn_in // 2
-    for iteration_index in range(sample_count + burn_in):
-        proposed_vector = parameter_vector + proposal_cholesky @ generator.normal(size=dimension)
-        proposed_log_posterior = log_posterior_unconstrained(proposed_vector, design, target)
-        acceptance_indicator = 0.0
-        if np.log(generator.uniform()) < proposed_log_posterior - current_log_posterior:
-            parameter_vector = proposed_vector
-            current_log_posterior = proposed_log_posterior
-            acceptance_indicator = 1.0
-            if iteration_index >= burn_in:
-                accepted_count += 1
-        log_posterior_trace[iteration_index] = current_log_posterior
-        if iteration_index < burn_in:
-            burn_in_history[iteration_index] = parameter_vector
-            learning_rate = min(0.5, 5.0 / (iteration_index + 1) ** 0.6)
-            log_scale += learning_rate * (acceptance_indicator - target_acceptance)
-            if (iteration_index + 1) % adaptation_interval == 0 \
-                    and iteration_index > transient_length + 10 * dimension:
-                post_transient = burn_in_history[transient_length:iteration_index + 1]
-                empirical_covariance = np.cov(post_transient.T)
-                ridge = 1e-10 * np.trace(empirical_covariance) / dimension * np.eye(dimension)
+    current = log_posterior_unconstrained(parameters, design, target)
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    variance_draws = np.zeros(draws)
+    trace = np.zeros(draws + burn_in)
+    history = np.zeros((burn_in, dimension))
+    transient = burn_in // 2
+    accepted = 0
+    for index in range(draws + burn_in):
+        proposal = parameters + cholesky @ generator.normal(size=dimension)
+        proposed = log_posterior_unconstrained(proposal, design, target)
+        indicator = 0.0
+        if np.log(generator.uniform()) < proposed - current:
+            parameters, current = proposal, proposed
+            indicator = 1.0
+            if index >= burn_in:
+                accepted += 1
+        trace[index] = current
+        if index < burn_in:
+            history[index] = parameters
+            log_scale += min(0.5, 5.0 / (index + 1) ** 0.6) * (indicator - target_acceptance)
+            if (index + 1) % adaptation_interval == 0 and index > transient + 10 * dimension:
+                empirical = np.cov(history[transient:index + 1].T)
                 try:
-                    base_cholesky = np.linalg.cholesky(empirical_covariance + ridge)
+                    base_cholesky = np.linalg.cholesky(
+                        empirical + 1e-10 * np.trace(empirical) / dimension * np.eye(dimension))
                 except np.linalg.LinAlgError:
                     pass
-            proposal_cholesky = np.exp(log_scale) * np.sqrt(optimal_scaling) * base_cholesky
+            cholesky = np.exp(log_scale) * np.sqrt(scaling) * base_cholesky
         else:
-            coefficient_samples[iteration_index - burn_in] = parameter_vector[:coefficient_count]
-            variance_samples[iteration_index - burn_in] = np.exp(parameter_vector[coefficient_count])
-    return {'coefficients': coefficient_samples, 'variances': variance_samples,
-            'acceptance_rate': accepted_count / sample_count, 'log_posterior': log_posterior_trace,
-            'final_log_scale': log_scale}
+            coefficient_draws[index - burn_in] = parameters[:coefficient_count]
+            variance_draws[index - burn_in] = np.exp(parameters[coefficient_count])
+    return {'coefficients': coefficient_draws, 'variances': variance_draws,
+            'acceptance_rate': accepted / draws, 'log_posterior': trace,
+            'gradient_evaluations': 0, 'density_evaluations': draws + burn_in}
 
 
-def gibbs_sampler(design, target, sample_count, burn_in, random_seed=0, initial_parameters=None):
+def gibbs_sampler(design, target, draws, burn_in, random_seed=0, initial_parameters=None):
+    """Full conditionals: beta is Gaussian, sigma^2 is Inverse-Gamma in shape-rate form.
+
+    numpy draws Gamma with a scale argument, so the rate b_n is passed as 1/b_n and the result
+    inverted to obtain the Inverse-Gamma draw.
+    """
     generator = np.random.default_rng(random_seed)
     observation_count, coefficient_count = design.shape
     cross_product = design.T @ design
     cross_target = design.T @ target
-    coefficients = np.zeros(coefficient_count)
-    noise_variance = 1.0
-    if initial_parameters is not None:
-        coefficients = initial_parameters[:coefficient_count].copy()
-        noise_variance = float(np.exp(initial_parameters[coefficient_count]))
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    variance_samples = np.zeros(sample_count)
-    log_posterior_trace = np.zeros(sample_count + burn_in)
-    identity_matrix = np.eye(coefficient_count)
-    for iteration_index in range(sample_count + burn_in):
-        precision_matrix = cross_product / noise_variance + identity_matrix / COEFFICIENT_PRIOR_VARIANCE
-        covariance_matrix = np.linalg.inv(precision_matrix)
-        mean_vector = covariance_matrix @ (cross_target / noise_variance)
-        coefficients = generator.multivariate_normal(mean_vector, covariance_matrix)
+    dimension = coefficient_count + 1
+    start = dispersed_starting_point(dimension, random_seed) if initial_parameters is None \
+        else initial_parameters
+    coefficients = start[:coefficient_count].copy()
+    noise_variance = float(np.exp(start[coefficient_count]))
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    variance_draws = np.zeros(draws)
+    trace = np.zeros(draws + burn_in)
+    identity = np.eye(coefficient_count)
+    for index in range(draws + burn_in):
+        precision = cross_product / noise_variance + identity / COEFFICIENT_PRIOR_VARIANCE
+        covariance = np.linalg.inv(precision)
+        mean_vector = covariance @ (cross_target / noise_variance)
+        coefficients = generator.multivariate_normal(mean_vector, covariance)
         residuals = target - design @ coefficients
-        noise_variance = 1.0 / generator.gamma(VARIANCE_PRIOR_SHAPE + observation_count / 2.0,
-                                               1.0 / (VARIANCE_PRIOR_SCALE
-                                                      + 0.5 * np.sum(residuals ** 2)))
-        log_posterior_trace[iteration_index] = log_posterior(coefficients, noise_variance,
-                                                             design, target)
-        if iteration_index >= burn_in:
-            coefficient_samples[iteration_index - burn_in] = coefficients
-            variance_samples[iteration_index - burn_in] = noise_variance
-    return {'coefficients': coefficient_samples, 'variances': variance_samples,
-            'acceptance_rate': 1.0, 'log_posterior': log_posterior_trace}
+        shape = VARIANCE_PRIOR_SHAPE + observation_count / 2.0
+        rate = VARIANCE_PRIOR_RATE + 0.5 * np.sum(residuals ** 2)
+        noise_variance = 1.0 / generator.gamma(shape, 1.0 / rate)
+        trace[index] = log_posterior(coefficients, noise_variance, design, target)
+        if index >= burn_in:
+            coefficient_draws[index - burn_in] = coefficients
+            variance_draws[index - burn_in] = noise_variance
+    return {'coefficients': coefficient_draws, 'variances': variance_draws,
+            'acceptance_rate': 1.0, 'log_posterior': trace, 'gradient_evaluations': 0,
+            'density_evaluations': draws + burn_in}
 
 
-def hamiltonian_monte_carlo(design, target, sample_count, burn_in, step_size=0.002,
-                            leapfrog_steps=15, random_seed=0, initial_parameters=None):
+def hamiltonian_monte_carlo(design, target, draws, burn_in, random_seed=0,
+                            initial_parameters=None, step_size=0.002, leapfrog_steps=15):
     generator = np.random.default_rng(random_seed)
     coefficient_count = design.shape[1]
     dimension = coefficient_count + 1
-    parameter_vector = np.zeros(dimension) if initial_parameters is None \
+    parameters = dispersed_starting_point(dimension, random_seed) if initial_parameters is None \
         else initial_parameters.copy()
-    current_log_posterior = log_posterior_unconstrained(parameter_vector, design, target)
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    variance_samples = np.zeros(sample_count)
-    log_posterior_trace = np.zeros(sample_count + burn_in)
-    accepted_count = 0
-    for iteration_index in range(sample_count + burn_in):
+    current = log_posterior_unconstrained(parameters, design, target)
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    variance_draws = np.zeros(draws)
+    trace = np.zeros(draws + burn_in)
+    accepted = 0
+    gradient_evaluations = 0
+    for index in range(draws + burn_in):
         momentum = generator.normal(size=dimension)
-        proposed_vector = parameter_vector.copy()
+        proposal = parameters.copy()
         proposed_momentum = momentum.copy()
-        gradient = gradient_log_posterior_unconstrained(proposed_vector, design, target)
+        gradient = gradient_log_posterior_unconstrained(proposal, design, target)
+        gradient_evaluations += 1
         proposed_momentum += 0.5 * step_size * gradient
         for leapfrog_index in range(leapfrog_steps):
-            proposed_vector += step_size * proposed_momentum
-            gradient = gradient_log_posterior_unconstrained(proposed_vector, design, target)
+            proposal += step_size * proposed_momentum
+            gradient = gradient_log_posterior_unconstrained(proposal, design, target)
+            gradient_evaluations += 1
             if leapfrog_index < leapfrog_steps - 1:
                 proposed_momentum += step_size * gradient
         proposed_momentum += 0.5 * step_size * gradient
-        proposed_log_posterior = log_posterior_unconstrained(proposed_vector, design, target)
-        energy_difference = (proposed_log_posterior - 0.5 * np.sum(proposed_momentum ** 2)) \
-            - (current_log_posterior - 0.5 * np.sum(momentum ** 2))
-        if np.log(generator.uniform()) < energy_difference:
-            parameter_vector = proposed_vector
-            current_log_posterior = proposed_log_posterior
-            if iteration_index >= burn_in:
-                accepted_count += 1
-        log_posterior_trace[iteration_index] = current_log_posterior
-        if iteration_index >= burn_in:
-            coefficient_samples[iteration_index - burn_in] = parameter_vector[:coefficient_count]
-            variance_samples[iteration_index - burn_in] = np.exp(parameter_vector[coefficient_count])
-    return {'coefficients': coefficient_samples, 'variances': variance_samples,
-            'acceptance_rate': accepted_count / sample_count, 'log_posterior': log_posterior_trace}
+        proposed = log_posterior_unconstrained(proposal, design, target)
+        energy_change = (proposed - 0.5 * np.sum(proposed_momentum ** 2)) \
+            - (current - 0.5 * np.sum(momentum ** 2))
+        if np.log(generator.uniform()) < energy_change:
+            parameters, current = proposal, proposed
+            if index >= burn_in:
+                accepted += 1
+        trace[index] = current
+        if index >= burn_in:
+            coefficient_draws[index - burn_in] = parameters[:coefficient_count]
+            variance_draws[index - burn_in] = np.exp(parameters[coefficient_count])
+    return {'coefficients': coefficient_draws, 'variances': variance_draws,
+            'acceptance_rate': accepted / draws, 'log_posterior': trace,
+            'gradient_evaluations': gradient_evaluations,
+            'density_evaluations': draws + burn_in}
 
 
-def robust_student_t_gibbs(design, target, sample_count, burn_in, degrees_of_freedom,
-                           random_seed=0):
-    """Gibbs sampler for Student-t regression using the normal scale-mixture representation.
+def robust_student_t_gibbs(design, target, draws, burn_in, degrees_of_freedom, random_seed=0):
+    """Student-t regression through the normal scale-mixture representation.
 
-    Writing y_i ~ N(x_i'b, s2 / w_i) with w_i ~ Gamma(v/2, v/2) marginalises to a Student-t
-    likelihood while keeping every full conditional conjugate, so no tuning is required.
+    y_i | beta, sigma^2, w_i ~ N(x_i' beta, sigma^2 / w_i) with w_i ~ Gamma(nu/2, nu/2) in
+    shape-rate form marginalises to a Student-t with nu degrees of freedom and scale sigma.
     """
     generator = np.random.default_rng(random_seed)
     observation_count, coefficient_count = design.shape
     coefficients = np.zeros(coefficient_count)
-    noise_scale_squared = 1.0
-    observation_weights = np.ones(observation_count)
-    coefficient_samples = np.zeros((sample_count, coefficient_count))
-    scale_samples = np.zeros(sample_count)
-    identity_matrix = np.eye(coefficient_count)
-    for iteration_index in range(sample_count + burn_in):
-        weighted_design = design * observation_weights[:, None]
-        precision_matrix = (design.T @ weighted_design) / noise_scale_squared \
-            + identity_matrix / COEFFICIENT_PRIOR_VARIANCE
-        covariance_matrix = np.linalg.inv(precision_matrix)
-        mean_vector = covariance_matrix @ (weighted_design.T @ target / noise_scale_squared)
-        coefficients = generator.multivariate_normal(mean_vector, covariance_matrix)
+    scale_squared = 1.0
+    weights = np.ones(observation_count)
+    coefficient_draws = np.zeros((draws, coefficient_count))
+    scale_draws = np.zeros(draws)
+    identity = np.eye(coefficient_count)
+    for index in range(draws + burn_in):
+        weighted_design = design * weights[:, None]
+        precision = (design.T @ weighted_design) / scale_squared \
+            + identity / COEFFICIENT_PRIOR_VARIANCE
+        covariance = np.linalg.inv(precision)
+        coefficients = generator.multivariate_normal(
+            covariance @ (weighted_design.T @ target / scale_squared), covariance)
         residuals = target - design @ coefficients
-        weighted_residual_sum = np.sum(observation_weights * residuals ** 2)
-        noise_scale_squared = 1.0 / generator.gamma(
+        scale_squared = 1.0 / generator.gamma(
             VARIANCE_PRIOR_SHAPE + observation_count / 2.0,
-            1.0 / (VARIANCE_PRIOR_SCALE + 0.5 * weighted_residual_sum))
-        weight_shape = (degrees_of_freedom + 1.0) / 2.0
-        weight_rate = (degrees_of_freedom + residuals ** 2 / noise_scale_squared) / 2.0
-        observation_weights = generator.gamma(weight_shape, 1.0 / weight_rate)
-        if iteration_index >= burn_in:
-            coefficient_samples[iteration_index - burn_in] = coefficients
-            scale_samples[iteration_index - burn_in] = noise_scale_squared
-    return {'coefficients': coefficient_samples, 'variances': scale_samples,
-            'acceptance_rate': 1.0}
+            1.0 / (VARIANCE_PRIOR_RATE + 0.5 * np.sum(weights * residuals ** 2)))
+        weights = generator.gamma((degrees_of_freedom + 1.0) / 2.0,
+                                  2.0 / (degrees_of_freedom + residuals ** 2 / scale_squared))
+        if index >= burn_in:
+            coefficient_draws[index - burn_in] = coefficients
+            scale_draws[index - burn_in] = scale_squared
+    return {'coefficients': coefficient_draws, 'variances': scale_draws, 'acceptance_rate': 1.0}
 
 
-def run_pymc_nuts(design, target, draw_count, tune_count, chain_count, random_seed=0):
-    import pymc
-    import pytensor
-    pytensor.config.cxx = ''
-    with pymc.Model():
-        coefficients = pymc.Normal('beta', mu=0.0, sigma=np.sqrt(COEFFICIENT_PRIOR_VARIANCE),
-                                   shape=design.shape[1])
-        noise_variance = pymc.InverseGamma('sigma2', alpha=VARIANCE_PRIOR_SHAPE,
-                                           beta=VARIANCE_PRIOR_SCALE)
-        expected_target = pymc.math.dot(design, coefficients)
-        pymc.Normal('y', mu=expected_target, sigma=pymc.math.sqrt(noise_variance),
-                    observed=target)
-        start_time = time.time()
-        inference_data = pymc.sample(draws=draw_count, tune=tune_count, chains=chain_count,
-                                     cores=1, random_seed=random_seed, progressbar=False,
-                                     compute_convergence_checks=False,
-                                     nuts={'max_treedepth': 7, 'target_accept': 0.8})
-        elapsed_time = time.time() - start_time
-    coefficient_chains = inference_data.posterior['beta'].values
-    variance_chains = inference_data.posterior['sigma2'].values
-    return {'coefficient_chains': [coefficient_chains[i] for i in range(chain_count)],
-            'variance_chains': [variance_chains[i] for i in range(chain_count)],
-            'time': elapsed_time, 'acceptance_rate': float('nan')}
+# --------------------------------------------------------------------------------------------
+# References
+# --------------------------------------------------------------------------------------------
 
+def analytical_posterior_reference(design, target, grid_size=6000):
+    """Deterministic reference for the posterior mean, by one-dimensional quadrature.
 
-def run_emcee_reference(design, target, walker_count=40, step_count=4000, discarded_steps=1000,
-                        random_seed=42):
-    """Sample the same posterior with emcee, an established third-party MCMC library.
-
-    emcee implements the affine-invariant ensemble sampler of Goodman and Weare, an algorithm
-    unrelated to any of ours, and is pure Python, so it needs no compiler toolchain. It serves
-    here purely as an external check on the posterior, not as an efficiency competitor: an
-    ensemble sampler's draws are not comparable with single-chain ESS on equal terms.
+    The prior on beta does not scale with sigma^2, so the joint posterior is not a standard
+    Normal-Inverse-Gamma. Marginalising beta analytically is still possible because
+        y | sigma^2 ~ N(0, sigma^2 I + tau^2 X X'),
+    whose log density is evaluated with Sylvester's determinant identity and the Woodbury
+    identity in O(n p^2). The remaining one-dimensional density over sigma^2 is integrated on a
+    grid, giving a reference that involves no sampling of any kind. It validates the likelihood
+    and prior algebra, not merely our sampling of them.
     """
+    observation_count, coefficient_count = design.shape
+    cross_product = design.T @ design
+    cross_target = design.T @ target
+    total_sum_of_squares = float(target @ target)
+    identity = np.eye(coefficient_count)
+    log_grid = np.linspace(np.log(1e-4), np.log(1e2), grid_size)
+    variance_grid = np.exp(log_grid)
+    log_density = np.empty(grid_size)
+    conditional_means = np.empty((grid_size, coefficient_count))
+    for index, noise_variance in enumerate(variance_grid):
+        precision = cross_product / noise_variance + identity / COEFFICIENT_PRIOR_VARIANCE
+        cholesky = np.linalg.cholesky(precision)
+        solved = np.linalg.solve(precision, cross_target / noise_variance)
+        conditional_means[index] = solved
+        log_determinant = observation_count * np.log(noise_variance) \
+            + 2.0 * np.sum(np.log(np.diag(cholesky))) \
+            + coefficient_count * np.log(COEFFICIENT_PRIOR_VARIANCE)
+        quadratic = total_sum_of_squares / noise_variance \
+            - (cross_target / noise_variance) @ solved
+        log_density[index] = -0.5 * (observation_count * np.log(2 * np.pi) + log_determinant
+                                     + quadratic) + log_prior_noise_variance(noise_variance) \
+            + np.log(noise_variance)
+    log_density -= log_density.max()
+    density = np.exp(log_density)
+    normaliser = np.trapezoid(density, log_grid)
+    weights = density / normaliser
+    posterior_mean_variance = float(np.trapezoid(weights * variance_grid, log_grid))
+    posterior_mean_coefficients = np.array(
+        [np.trapezoid(weights * conditional_means[:, j], log_grid)
+         for j in range(coefficient_count)])
+    return {'posterior_mean_coefficients': posterior_mean_coefficients.tolist(),
+            'posterior_mean_variance': posterior_mean_variance,
+            'grid_size': grid_size, 'method': 'one-dimensional quadrature over log sigma^2'}
+
+
+def run_emcee_reference(design, target, walkers=40, steps=12000, discard=4000,
+                        random_seed=42):
     import emcee
     generator = np.random.default_rng(random_seed)
     coefficient_count = design.shape[1]
     dimension = coefficient_count + 1
-    least_squares_coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
-    residual_variance = float(np.mean((target - design @ least_squares_coefficients) ** 2))
-    centre = np.concatenate([least_squares_coefficients, [np.log(residual_variance)]])
-    starting_positions = centre + 1e-3 * generator.normal(size=(walker_count, dimension))
-    ensemble_sampler = emcee.EnsembleSampler(walker_count, dimension,
-                                             log_posterior_unconstrained, args=(design, target))
-    start_time = time.time()
-    ensemble_sampler.run_mcmc(starting_positions, step_count, progress=False)
-    elapsed_time = time.time() - start_time
-    retained = ensemble_sampler.get_chain(discard=discarded_steps, flat=False)
-    flattened = retained.reshape(-1, dimension)
-    walkers_per_group = walker_count // CHAIN_COUNT
-    coefficient_chains, variance_chains = [], []
-    for group_index in range(CHAIN_COUNT):
-        group = retained[:, group_index * walkers_per_group:(group_index + 1) * walkers_per_group, :]
-        group = group.reshape(-1, dimension)
-        coefficient_chains.append(group[:, :coefficient_count])
-        variance_chains.append(np.exp(group[:, coefficient_count]))
-    scale_reductions = {}
-    for label, index in [('Intercept', 0), ('beta_1', 1), ('beta_3', 3)]:
-        scale_reductions[label] = split_potential_scale_reduction(
-            [chain[:, index] for chain in coefficient_chains])
-    scale_reductions['sigma2'] = split_potential_scale_reduction(variance_chains)
-    return {'posterior_mean_coefficients': flattened[:, :coefficient_count].mean(axis=0).tolist(),
-            'posterior_sd_coefficients': flattened[:, :coefficient_count].std(axis=0).tolist(),
-            'posterior_mean_variance': float(np.exp(flattened[:, coefficient_count]).mean()),
-            'split_rhat': scale_reductions, 'time': elapsed_time,
-            'acceptance_rate': float(np.mean(ensemble_sampler.acceptance_fraction)),
-            'walkers': walker_count, 'steps': step_count, 'discarded_steps': discarded_steps,
-            'total_draws': int(flattened.shape[0]), 'library': 'emcee %s' % emcee.__version__}
+    least_squares = np.linalg.lstsq(design, target, rcond=None)[0]
+    residual_variance = float(np.mean((target - design @ least_squares) ** 2))
+    centre = np.concatenate([least_squares, [np.log(residual_variance)]])
+    start = centre + 1e-3 * generator.normal(size=(walkers, dimension))
+    sampler = emcee.EnsembleSampler(walkers, dimension, log_posterior_unconstrained,
+                                    args=(design, target))
+    started = time.time()
+    sampler.run_mcmc(start, steps, progress=False)
+    elapsed = time.time() - started
+    retained = sampler.get_chain(discard=discard, flat=False)
+    flat = retained.reshape(-1, dimension)
+    walker_chains = [retained[:, walker, :] for walker in range(walkers)]
+    diagnostics = {}
+    for label, index in REPORTED_PARAMETERS:
+        chains = [chain[:, index] for chain in walker_chains]
+        diagnostics[label] = {'rhat': maximum_rhat(chains),
+                              'bulk_ess': bulk_effective_sample_size(chains),
+                              'tail_ess': tail_effective_sample_size(chains)}
+    variance_chains = [np.exp(chain[:, coefficient_count]) for chain in walker_chains]
+    diagnostics['sigma2'] = {'rhat': maximum_rhat(variance_chains),
+                             'bulk_ess': bulk_effective_sample_size(variance_chains),
+                             'tail_ess': tail_effective_sample_size(variance_chains)}
+    return {'posterior_mean_coefficients': flat[:, :coefficient_count].mean(axis=0).tolist(),
+            'posterior_mean_variance': float(np.exp(flat[:, coefficient_count]).mean()),
+            'time': elapsed, 'walkers': walkers, 'steps': steps, 'discarded_steps': discard,
+            'total_draws': int(flat.shape[0]),
+            'acceptance_rate': float(np.mean(sampler.acceptance_fraction)),
+            'diagnostics': diagnostics,
+            'worst_rhat': max(entry['rhat'] for entry in diagnostics.values()),
+            'minimum_bulk_ess': min(entry['bulk_ess'] for entry in diagnostics.values()),
+            'library': 'emcee %s' % emcee.__version__}
 
 
-def summarise_chains(coefficient_chains, variance_chains, elapsed_time, acceptance_rate):
-    effective_sizes = []
-    for coefficient_index in range(coefficient_chains[0].shape[1]):
-        for chain in coefficient_chains:
-            effective_sizes.append(effective_sample_size(chain[:, coefficient_index]))
-    for chain in variance_chains:
-        effective_sizes.append(effective_sample_size(chain))
-    average_effective_size = float(np.mean(effective_sizes))
-    parameter_labels = ['Intercept', 'beta_1', 'beta_3', 'sigma2']
-    parameter_indices = [0, 1, 3]
-    scale_reductions = {}
-    for label, index in zip(parameter_labels[:3], parameter_indices):
-        scale_reductions[label] = split_potential_scale_reduction([c[:, index]
-                                                                   for c in coefficient_chains])
-    scale_reductions['sigma2'] = split_potential_scale_reduction(variance_chains)
-    return {'acceptance_rate': acceptance_rate, 'avg_ess': average_effective_size,
-            'time': elapsed_time, 'ess_per_sec': average_effective_size / elapsed_time,
-            'split_rhat': scale_reductions,
-            'mcse_intercept': monte_carlo_standard_error([c[:, 0] for c in coefficient_chains]),
+# --------------------------------------------------------------------------------------------
+# Summaries
+# --------------------------------------------------------------------------------------------
+
+def summarise_sampler(coefficient_chains, variance_chains, elapsed_time, acceptance_rate,
+                      gradient_evaluations, draws_per_chain):
+    """Aggregate diagnostics.
+
+    Every diagnostic is computed jointly across all chains for one parameter at a time. The
+    reported scalar is then the WORST value over the monitored parameters: the maximum R-hat and
+    the minimum bulk and tail ESS. Taking the worst rather than an average means a single badly
+    behaved coordinate cannot be hidden by well behaved ones.
+    """
+    per_parameter = {}
+    for label, index in REPORTED_PARAMETERS:
+        chains = [chain[:, index] for chain in coefficient_chains]
+        per_parameter[label] = {'rhat': maximum_rhat(chains),
+                                'bulk_ess': bulk_effective_sample_size(chains),
+                                'tail_ess': tail_effective_sample_size(chains),
+                                'mcse': monte_carlo_standard_error(chains)}
+    per_parameter['sigma2'] = {'rhat': maximum_rhat(variance_chains),
+                               'bulk_ess': bulk_effective_sample_size(variance_chains),
+                               'tail_ess': tail_effective_sample_size(variance_chains),
+                               'mcse': monte_carlo_standard_error(variance_chains)}
+    worst_rhat = max(entry['rhat'] for entry in per_parameter.values())
+    minimum_bulk = min(entry['bulk_ess'] for entry in per_parameter.values())
+    minimum_tail = min(entry['tail_ess'] for entry in per_parameter.values())
+    total_draws = draws_per_chain * len(coefficient_chains)
+    return {'acceptance_rate': acceptance_rate, 'time': elapsed_time,
+            'total_draws': total_draws, 'worst_rhat': worst_rhat,
+            'min_bulk_ess': minimum_bulk, 'min_tail_ess': minimum_tail,
+            'bulk_ess_per_second': minimum_bulk / elapsed_time,
+            'bulk_ess_per_gradient': (minimum_bulk / gradient_evaluations)
+            if gradient_evaluations else None,
+            'gradient_evaluations': gradient_evaluations,
+            'mcse_intercept': per_parameter['Intercept']['mcse'],
+            'per_parameter': per_parameter,
+            'converged': bool(worst_rhat < RHAT_THRESHOLD and minimum_bulk >= BULK_ESS_THRESHOLD),
             'posterior_mean_coefficients': np.vstack(coefficient_chains).mean(axis=0).tolist(),
             'posterior_mean_variance': float(np.concatenate(variance_chains).mean())}
 
 
-def posterior_predictive_evaluation(coefficient_samples, variance_samples, test_design, test_target,
-                                    random_seed=0, degrees_of_freedom=None):
+def posterior_predictive_evaluation(coefficient_draws, variance_draws, design, target,
+                                    target_std, random_seed=0, degrees_of_freedom=None):
+    """Posterior predictive intervals.
+
+    For each retained draw (beta_s, sigma^2_s) a replicate observation is generated as
+        y* = x' beta_s + sigma_s * e,      e ~ N(0,1) or t_nu,
+    so the interval carries both parameter uncertainty, through the spread of beta_s, and
+    observation noise, through sigma_s. Intervals are empirical quantiles of these replicates,
+    not mean plus a multiple of a standard deviation.
+    """
     generator = np.random.default_rng(random_seed)
-    draw_indices = generator.choice(len(coefficient_samples),
-                                    size=min(PREDICTIVE_DRAW_COUNT, len(coefficient_samples)),
-                                    replace=False)
-    selected_coefficients = coefficient_samples[draw_indices]
-    selected_variances = variance_samples[draw_indices]
-    conditional_means = selected_coefficients @ test_design.T
-    scale_values = np.sqrt(selected_variances)[:, None]
+    selection = generator.choice(len(coefficient_draws),
+                                 size=min(PREDICTIVE_DRAW_COUNT, len(coefficient_draws)),
+                                 replace=False)
+    coefficients = coefficient_draws[selection]
+    scales = np.sqrt(variance_draws[selection])[:, None]
+    conditional_means = coefficients @ design.T
     if degrees_of_freedom is None:
-        noise_draws = generator.normal(size=conditional_means.shape)
+        noise = generator.normal(size=conditional_means.shape)
     else:
-        noise_draws = generator.standard_t(degrees_of_freedom, size=conditional_means.shape)
-    predictive_draws = conditional_means + scale_values * noise_draws
+        noise = generator.standard_t(degrees_of_freedom, size=conditional_means.shape)
+    replicates = conditional_means + scales * noise
+    log_density = predictive_log_density(conditional_means, scales, target, degrees_of_freedom)
     point_predictions = conditional_means.mean(axis=0)
-    root_mean_squared_error = float(np.sqrt(np.mean((test_target - point_predictions) ** 2)))
-    median_absolute_error = float(np.median(np.abs(test_target - point_predictions)))
-    coverage_results = {}
-    interval_widths = {}
-    for nominal_level in [0.50, 0.95]:
-        lower_quantile = np.quantile(predictive_draws, (1 - nominal_level) / 2, axis=0)
-        upper_quantile = np.quantile(predictive_draws, 1 - (1 - nominal_level) / 2, axis=0)
-        coverage_results['coverage_%d' % int(nominal_level * 100)] = float(
-            np.mean((test_target >= lower_quantile) & (test_target <= upper_quantile)))
-        interval_widths['width_%d' % int(nominal_level * 100)] = float(
-            np.mean(upper_quantile - lower_quantile))
-    return {'rmse': root_mean_squared_error, 'median_absolute_error': median_absolute_error,
-            'point_predictions': point_predictions, **coverage_results, **interval_widths}
+    errors = target - point_predictions
+    results = {'rmse': float(np.sqrt(np.mean(errors ** 2))),
+               'median_absolute_error': float(np.median(np.abs(errors))),
+               'rmse_percentage_points': float(np.sqrt(np.mean(errors ** 2)) * target_std),
+               'median_absolute_error_percentage_points': float(
+                   np.median(np.abs(errors)) * target_std),
+               'point_predictions': point_predictions}
+    for level in (0.50, 0.95):
+        lower = np.quantile(replicates, (1 - level) / 2, axis=0)
+        upper = np.quantile(replicates, 1 - (1 - level) / 2, axis=0)
+        inside = (target >= lower) & (target <= upper)
+        key = int(level * 100)
+        results['coverage_%d' % key] = float(inside.mean())
+        results['width_%d' % key] = float(np.mean(upper - lower))
+        results['width_%d_percentage_points' % key] = float(np.mean(upper - lower) * target_std)
+        results['coverage_%d_interval' % key] = block_bootstrap_interval(inside, random_seed)
+    results['mean_log_predictive_density'] = log_density
+    return results
 
 
-def analyse_residuals(train_design, train_target, test_design, test_target):
-    least_squares_coefficients = np.linalg.lstsq(train_design, train_target, rcond=None)[0]
-    train_residuals = train_target - train_design @ least_squares_coefficients
-    test_residuals = test_target - test_design @ least_squares_coefficients
-    median_absolute_deviation = float(np.median(np.abs(test_residuals)))
-    return {'train_residual_sd': float(train_residuals.std()),
-            'test_residual_sd': float(test_residuals.std()),
-            'test_residual_mad': median_absolute_deviation,
-            'sd_to_robust_sd_ratio': float(test_residuals.std() / (1.4826 * median_absolute_deviation)),
-            'excess_kurtosis': float(stats.kurtosis(test_residuals)),
-            'skewness': float(stats.skew(test_residuals)),
-            'fraction_beyond_three_sd': float(np.mean(np.abs(test_residuals)
-                                                      > 3 * train_residuals.std())),
-            'test_residuals': test_residuals, 'train_residuals': train_residuals}
+def predictive_log_density(conditional_means, scales, target, degrees_of_freedom=None):
+    """Mean log pointwise predictive density, evaluated exactly for each posterior draw.
+
+    The predictive density is the posterior mixture p(y*|data) = (1/S) sum_s p(y*|theta_s), and
+    each component is a Gaussian or Student-t with known mean and scale, so it is evaluated in
+    closed form rather than estimated from simulated replicates. This avoids the bias a kernel
+    density estimate would introduce in the tails, which is exactly where the two likelihoods
+    differ and therefore where the model choice is decided.
+    """
+    from scipy.special import logsumexp
+    if degrees_of_freedom is None:
+        component_log_density = stats.norm.logpdf(target[None, :], loc=conditional_means,
+                                                  scale=scales)
+    else:
+        component_log_density = stats.t.logpdf(target[None, :], degrees_of_freedom,
+                                               loc=conditional_means, scale=scales)
+    draw_count = conditional_means.shape[0]
+    pointwise = logsumexp(component_log_density, axis=0) - np.log(draw_count)
+    return float(np.mean(pointwise))
 
 
-def posterior_geometry_summary(train_design, noise_variance_estimate):
-    precision_matrix = train_design.T @ train_design / noise_variance_estimate \
-        + np.eye(train_design.shape[1]) / COEFFICIENT_PRIOR_VARIANCE
-    covariance_matrix = np.linalg.inv(precision_matrix)
-    eigenvalues = np.linalg.eigvalsh(covariance_matrix)
-    standard_deviations = np.sqrt(np.diag(covariance_matrix))
-    correlation_matrix = covariance_matrix / np.outer(standard_deviations, standard_deviations)
-    off_diagonal_mask = ~np.eye(len(correlation_matrix), dtype=bool)
+def block_bootstrap_interval(indicator, random_seed=0):
+    """Moving-block bootstrap confidence interval for a coverage rate under serial dependence."""
+    generator = np.random.default_rng(random_seed + 991)
+    length = len(indicator)
+    if length < BOOTSTRAP_BLOCK_LENGTH * 2:
+        return [float('nan'), float('nan')]
+    block_count = int(np.ceil(length / BOOTSTRAP_BLOCK_LENGTH))
+    maximum_start = length - BOOTSTRAP_BLOCK_LENGTH
+    starts = generator.integers(0, maximum_start + 1, size=(BOOTSTRAP_REPLICATES, block_count))
+    offsets = np.arange(BOOTSTRAP_BLOCK_LENGTH)
+    estimates = np.empty(BOOTSTRAP_REPLICATES)
+    for replicate in range(BOOTSTRAP_REPLICATES):
+        indices = (starts[replicate][:, None] + offsets[None, :]).reshape(-1)[:length]
+        estimates[replicate] = indicator[indices].mean()
+    return [float(np.quantile(estimates, 0.025)), float(np.quantile(estimates, 0.975))]
+
+
+def residual_diagnostics(design, target, machine_labels, target_std, maximum_lag=40):
+    least_squares = np.linalg.lstsq(design, target, rcond=None)[0]
+    residuals = target - design @ least_squares
+    centered = residuals - residuals.mean()
+    autocorrelation = np.correlate(centered, centered, mode='full')[len(centered) - 1:]
+    autocorrelation = autocorrelation / autocorrelation[0]
+    length = len(residuals)
+    lags = np.arange(1, maximum_lag + 1)
+    statistic = length * (length + 2) * np.sum(
+        autocorrelation[1:maximum_lag + 1] ** 2 / (length - lags))
+    per_machine_std = []
+    for machine in np.unique(machine_labels):
+        mask = machine_labels == machine
+        if mask.sum() >= 10:
+            per_machine_std.append(float(residuals[mask].std()))
+    if not per_machine_std:
+        per_machine_std = [float(residuals.std())]
+    return {'autocorrelation': autocorrelation[:maximum_lag + 1].tolist(),
+            'ljung_box_statistic': float(statistic), 'ljung_box_lags': int(maximum_lag),
+            'ljung_box_p_value': float(stats.chi2.sf(statistic, maximum_lag)),
+            'lag1_autocorrelation': float(autocorrelation[1]),
+            'excess_kurtosis': float(stats.kurtosis(residuals)),
+            'skewness': float(stats.skew(residuals)),
+            'residual_sd': float(residuals.std()),
+            'residual_mad': float(np.median(np.abs(residuals))),
+            'sd_to_robust_sd_ratio': float(residuals.std()
+                                           / (1.4826 * np.median(np.abs(residuals)))),
+            'per_machine_residual_sd_min': float(np.min(per_machine_std)),
+            'per_machine_residual_sd_max': float(np.max(per_machine_std)),
+            'per_machine_residual_sd_median': float(np.median(per_machine_std)),
+            'per_machine_count': len(per_machine_std),
+            'pooled_residual_sd_percentage_points': float(residuals.std() * target_std)}
+
+
+def posterior_geometry(design, noise_variance):
+    precision = design.T @ design / noise_variance \
+        + np.eye(design.shape[1]) / COEFFICIENT_PRIOR_VARIANCE
+    covariance = np.linalg.inv(precision)
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    standard_deviations = np.sqrt(np.diag(covariance))
+    correlation = covariance / np.outer(standard_deviations, standard_deviations)
+    off_diagonal = ~np.eye(len(correlation), dtype=bool)
     return {'condition_number': float(eigenvalues.max() / eigenvalues.min()),
-            'max_absolute_correlation': float(np.abs(correlation_matrix[off_diagonal_mask]).max()),
+            'max_absolute_correlation': float(np.abs(correlation[off_diagonal]).max()),
             'narrowest_direction_sd': float(np.sqrt(eigenvalues.min())),
             'widest_direction_sd': float(np.sqrt(eigenvalues.max())),
-            'correlation_matrix': correlation_matrix}
+            'correlation_matrix': correlation}
 
 
-def initialisation_sensitivity_study(train_design, train_target, least_squares_coefficients):
-    coefficient_count = train_design.shape[1]
-    starting_points = {
-        'zeros (default)': np.zeros(coefficient_count + 1),
+# --------------------------------------------------------------------------------------------
+# Studies
+# --------------------------------------------------------------------------------------------
+
+def run_sampler_repeatedly(sampler_function, design, target, label, extra_arguments=None):
+    """Run the full multi-chain experiment several times to quantify run-to-run variability."""
+    extra_arguments = extra_arguments or {}
+    summaries, pooled_coefficients, pooled_variances = [], None, None
+    for repeat_index in range(REPEAT_COUNT):
+        coefficient_chains, variance_chains, acceptance_rates = [], [], []
+        gradient_total = 0
+        started = time.time()
+        for chain_index in range(CHAIN_COUNT):
+            output = sampler_function(design, target, POSTERIOR_DRAWS, BURN_IN_DRAWS,
+                                      random_seed=1000 * repeat_index + chain_index,
+                                      **extra_arguments)
+            coefficient_chains.append(output['coefficients'])
+            variance_chains.append(output['variances'])
+            acceptance_rates.append(output['acceptance_rate'])
+            gradient_total += output.get('gradient_evaluations', 0)
+        elapsed = time.time() - started
+        summary = summarise_sampler(coefficient_chains, variance_chains, elapsed,
+                                    float(np.mean(acceptance_rates)), gradient_total,
+                                    POSTERIOR_DRAWS)
+        summaries.append(summary)
+        if repeat_index == 0:
+            pooled_coefficients, pooled_variances = coefficient_chains, variance_chains
+    primary = dict(summaries[0])
+    for key in ('time', 'min_bulk_ess', 'min_tail_ess', 'bulk_ess_per_second', 'worst_rhat'):
+        values = np.array([summary[key] for summary in summaries], dtype=float)
+        primary['%s_mean' % key] = float(values.mean())
+        primary['%s_sd' % key] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+    primary['repeats'] = REPEAT_COUNT
+    primary['label'] = label
+    return primary, pooled_coefficients, pooled_variances
+
+
+def hamiltonian_sensitivity_study(design, target, warm_start):
+    """Vary step size and trajectory length jointly, reporting ESS per gradient evaluation.
+
+    The grid runs are warm started at the least-squares fit and given a long burn-in. A short
+    run from a dispersed start would not have converged for every configuration, and an ESS
+    computed from an unconverged chain measures nothing, so each cell also reports its R-hat and
+    is marked converged or not.
+    """
+    results = []
+    for step_size in (0.001, 0.002, 0.004, 0.008):
+        for leapfrog_steps in (5, 10, 20):
+            chains, variance_chains, acceptances = [], [], []
+            gradient_total = 0
+            started = time.time()
+            for chain_index in range(4):
+                perturbed = warm_start + 0.01 * np.random.default_rng(
+                    900 + chain_index).normal(size=len(warm_start))
+                output = hamiltonian_monte_carlo(design, target, 4000, 1500,
+                                                 random_seed=77 + chain_index,
+                                                 initial_parameters=perturbed,
+                                                 step_size=step_size,
+                                                 leapfrog_steps=leapfrog_steps)
+                chains.append(output['coefficients'])
+                variance_chains.append(output['variances'])
+                acceptances.append(output['acceptance_rate'])
+                gradient_total += output['gradient_evaluations']
+            elapsed = time.time() - started
+            bulk = min(bulk_effective_sample_size([chain[:, index] for chain in chains])
+                       for _, index in REPORTED_PARAMETERS)
+            worst = max(max(maximum_rhat([chain[:, index] for chain in chains])
+                            for _, index in REPORTED_PARAMETERS),
+                        maximum_rhat(variance_chains))
+            converged = bool(worst < RHAT_THRESHOLD)
+            results.append({'step_size': step_size, 'leapfrog_steps': leapfrog_steps,
+                            'acceptance': float(np.mean(acceptances)), 'bulk_ess': float(bulk),
+                            'worst_rhat': float(worst), 'converged': converged,
+                            'gradient_evaluations': int(gradient_total),
+                            'bulk_ess_per_gradient': float(bulk / gradient_total),
+                            'bulk_ess_per_second': float(bulk / elapsed), 'time': elapsed})
+            print('    eps=%.3f L=%2d -> acc %.3f | R-hat %.4f | bulk ESS %7.1f | ESS/grad %.2e%s'
+                  % (step_size, leapfrog_steps, results[-1]['acceptance'], worst, bulk,
+                     results[-1]['bulk_ess_per_gradient'], '' if converged else '  [NOT conv]'))
+    return results
+
+
+def metropolis_sensitivity_study(design, target):
+    results = []
+    for step in (0.0005, 0.001, 0.005, 0.01, 0.02, 0.05):
+        output = metropolis_hastings(design, target, 3000, 500, random_seed=5,
+                                     coefficient_step=step)
+        results.append({'step': step, 'acceptance': float(output['acceptance_rate'])})
+    return results
+
+
+def initialisation_study(design, target, least_squares_coefficients):
+    """Iterations needed to reach the stationary level of the log posterior, from four starts.
+
+    The stationary level is the median log posterior over the final 500 iterations of a
+    1,500-iteration run. A chain is deemed to have reached it at the first iteration after which
+    the log posterior stays within 1 percent of that level for 50 consecutive iterations.
+    Requiring persistence rather than a single crossing stops a chain being credited for merely
+    passing through the region on its way elsewhere.
+    """
+    coefficient_count = design.shape[1]
+    starts = {
+        'zeros': np.zeros(coefficient_count + 1),
         'least squares fit': np.concatenate([least_squares_coefficients, [np.log(0.15)]]),
         'dispersed (all +3)': np.concatenate([np.full(coefficient_count, 3.0), [np.log(5.0)]]),
         'extreme variance': np.concatenate([np.zeros(coefficient_count), [np.log(100.0)]]),
     }
-    sampler_functions = {'Preconditioned MH': preconditioned_metropolis_hastings,
-                         'Gibbs': gibbs_sampler, 'HMC': hamiltonian_monte_carlo}
-    study_results = {}
-    for sampler_name, sampler_function in sampler_functions.items():
-        study_results[sampler_name] = {}
-        for start_name, start_vector in starting_points.items():
-            sampler_output = sampler_function(train_design, train_target, 1000, 500,
-                                              random_seed=7, initial_parameters=start_vector)
-            log_posterior_trace = sampler_output['log_posterior']
-            stationary_level = np.median(log_posterior_trace[-500:])
-            tolerance_band = 0.01 * abs(stationary_level)
-            within_band = np.abs(log_posterior_trace - stationary_level) < tolerance_band
-            first_entry = int(np.argmax(within_band)) if within_band.any() else -1
-            study_results[sampler_name][start_name] = {
-                'iterations_to_stationarity': first_entry,
-                'log_posterior_trace': log_posterior_trace[:400].tolist(),
-                'final_log_posterior': float(stationary_level)}
-    return study_results
+    samplers = {'Preconditioned MH': preconditioned_metropolis_hastings, 'Gibbs': gibbs_sampler,
+                'HMC': hamiltonian_monte_carlo}
+    persistence = 50
+    results = {}
+    for sampler_name, sampler_function in samplers.items():
+        results[sampler_name] = {}
+        for start_name, start_vector in starts.items():
+            output = sampler_function(design, target, 1000, 500, random_seed=7,
+                                      initial_parameters=start_vector)
+            trace = output['log_posterior']
+            level = float(np.median(trace[-500:]))
+            within = np.abs(trace - level) < 0.01 * abs(level)
+            reached, run_length = -1, 0
+            for position, flag in enumerate(within):
+                run_length = run_length + 1 if flag else 0
+                if run_length >= persistence:
+                    reached = position - persistence + 1
+                    break
+            results[sampler_name][start_name] = {'iterations_to_stationarity': int(reached),
+                                                 'log_posterior_trace': trace[:400].tolist(),
+                                                 'stationary_level': level}
+    return results
 
 
-def main():
-    print('Loading and preparing data...')
-    dataset = load_and_prepare_data()
-    train_design = dataset['train_design']
-    train_target = dataset['train_target']
-    test_design = dataset['test_design']
-    test_target = dataset['test_target']
-    print('  train %d, test %d, parameters %d' % (len(train_target), len(test_target),
-                                                  train_design.shape[1]))
-    least_squares_coefficients = np.linalg.lstsq(train_design, train_target, rcond=None)[0]
-    least_squares_rmse = float(np.sqrt(np.mean((test_target - test_design
-                                                @ least_squares_coefficients) ** 2)))
-    print('\nAnalysing the residual distribution...')
-    residual_analysis = analyse_residuals(train_design, train_target, test_design, test_target)
-    print('  excess kurtosis %.1f, sd/robust-sd ratio %.2f'
-          % (residual_analysis['excess_kurtosis'], residual_analysis['sd_to_robust_sd_ratio']))
-    print('\nSummarising the posterior geometry...')
-    geometry_summary = posterior_geometry_summary(train_design,
-                                                  residual_analysis['train_residual_sd'] ** 2)
-    print('  condition number %.1f, max |correlation| %.3f'
-          % (geometry_summary['condition_number'], geometry_summary['max_absolute_correlation']))
-    sampler_specifications = [
-        ('MH', metropolis_hastings, {}),
-        ('Adaptive MH (naive)', adaptive_metropolis_hastings, {}),
-        ('Preconditioned MH', preconditioned_metropolis_hastings, {}),
-        ('Gibbs', gibbs_sampler, {}),
-        ('HMC', hamiltonian_monte_carlo, {}),
-    ]
-    chain_storage = {}
-    method_summaries = {}
-    for method_name, sampler_function, extra_arguments in sampler_specifications:
-        print('\nRunning %s (%d chains x %d samples)...' % (method_name, CHAIN_COUNT,
-                                                            POSTERIOR_SAMPLE_COUNT))
-        coefficient_chains, variance_chains, acceptance_rates = [], [], []
-        start_time = time.time()
-        for chain_index in range(CHAIN_COUNT):
-            sampler_output = sampler_function(train_design, train_target, POSTERIOR_SAMPLE_COUNT,
-                                              BURN_IN_COUNT, random_seed=42 + chain_index,
-                                              **extra_arguments)
-            coefficient_chains.append(sampler_output['coefficients'])
-            variance_chains.append(sampler_output['variances'])
-            acceptance_rates.append(sampler_output['acceptance_rate'])
-        elapsed_time = time.time() - start_time
-        chain_storage[method_name] = {'coefficients': coefficient_chains,
-                                      'variances': variance_chains}
-        method_summaries[method_name] = summarise_chains(coefficient_chains, variance_chains,
-                                                         elapsed_time, float(np.mean(acceptance_rates)))
-        predictive_metrics = posterior_predictive_evaluation(np.vstack(coefficient_chains),
-                                                             np.concatenate(variance_chains),
-                                                             test_design, test_target)
-        method_summaries[method_name].update({key: value for key, value in predictive_metrics.items()
-                                              if key != 'point_predictions'})
-        chain_storage[method_name]['point_predictions'] = predictive_metrics['point_predictions']
-        print('  acceptance %.3f | ESS %.1f | %.2f s | ESS/s %.1f | split R-hat(intercept) %.4f'
-              % (method_summaries[method_name]['acceptance_rate'],
-                 method_summaries[method_name]['avg_ess'], elapsed_time,
-                 method_summaries[method_name]['ess_per_sec'],
-                 method_summaries[method_name]['split_rhat']['Intercept']))
-    skip_nuts_reference = '--skip-nuts' in sys.argv
-    if skip_nuts_reference:
-        print('\nSkipping the PyMC NUTS reference run (--skip-nuts was passed). Every other '
-              'result in this script is unaffected; only Section 5.4 of the report is omitted.')
-    try:
-        if skip_nuts_reference:
-            raise RuntimeError('skipped at the user\'s request')
-        print('\nRunning the PyMC NUTS reference implementation...')
-        nuts_output = run_pymc_nuts(train_design, train_target, draw_count=NUTS_DRAW_COUNT,
-                                    tune_count=NUTS_TUNE_COUNT, chain_count=CHAIN_COUNT,
-                                    random_seed=42)
-        chain_storage['NUTS (PyMC)'] = {'coefficients': nuts_output['coefficient_chains'],
-                                        'variances': nuts_output['variance_chains']}
-        method_summaries['NUTS (PyMC)'] = summarise_chains(nuts_output['coefficient_chains'],
-                                                           nuts_output['variance_chains'],
-                                                           nuts_output['time'], float('nan'))
-        nuts_predictive = posterior_predictive_evaluation(
-            np.vstack(nuts_output['coefficient_chains']),
-            np.concatenate(nuts_output['variance_chains']), test_design, test_target)
-        method_summaries['NUTS (PyMC)'].update({key: value for key, value in nuts_predictive.items()
-                                                if key != 'point_predictions'})
-        print('  NUTS finished in %.1f s, ESS %.1f'
-              % (nuts_output['time'], method_summaries['NUTS (PyMC)']['avg_ess']))
-    except Exception as nuts_error:
-        print('  NUTS reference run failed: %s' % nuts_error)
-    print('\nRunning the emcee external reference...')
-    external_reference = None
-    try:
-        external_reference = run_emcee_reference(train_design, train_target)
-        largest_deviation = max(
-            abs(reference_value - gibbs_value) for reference_value, gibbs_value
-            in zip(external_reference['posterior_mean_coefficients'],
-                   method_summaries['Gibbs']['posterior_mean_coefficients']))
-        external_reference['largest_deviation_from_gibbs'] = float(largest_deviation)
-        print('  %s: %d draws in %.1f s | acceptance %.3f | largest deviation from Gibbs %.5f'
-              % (external_reference['library'], external_reference['total_draws'],
-                 external_reference['time'], external_reference['acceptance_rate'],
-                 largest_deviation))
-    except Exception as reference_error:
-        print('  emcee reference run failed: %s' % reference_error)
-    print('\nRunning the robust Student-t Gibbs sampler (v=%.0f)...' % STUDENT_T_DEGREES_OF_FREEDOM)
-    start_time = time.time()
-    robust_output = robust_student_t_gibbs(train_design, train_target, POSTERIOR_SAMPLE_COUNT,
-                                           BURN_IN_COUNT, STUDENT_T_DEGREES_OF_FREEDOM,
-                                           random_seed=42)
-    robust_elapsed_time = time.time() - start_time
-    robust_predictive = posterior_predictive_evaluation(
-        robust_output['coefficients'], robust_output['variances'], test_design, test_target,
-        degrees_of_freedom=STUDENT_T_DEGREES_OF_FREEDOM)
-    robust_summary = {key: value for key, value in robust_predictive.items()
-                      if key != 'point_predictions'}
-    robust_summary['time'] = robust_elapsed_time
-    robust_summary['degrees_of_freedom'] = STUDENT_T_DEGREES_OF_FREEDOM
-    print('  RMSE %.4f | median abs error %.4f | 50%% coverage %.3f | 95%% coverage %.3f'
-          % (robust_summary['rmse'], robust_summary['median_absolute_error'],
-             robust_summary['coverage_50'], robust_summary['coverage_95']))
-    print('\nRunning the initialisation sensitivity study...')
-    initialisation_results = initialisation_sensitivity_study(train_design, train_target,
-                                                              least_squares_coefficients)
-    for sampler_name, per_start in initialisation_results.items():
-        for start_name, entry in per_start.items():
-            print('  %-12s from %-20s -> stationary after %d iterations'
-                  % (sampler_name, start_name, entry['iterations_to_stationarity']))
-    print('\nGenerating figures...')
-    generate_figures(chain_storage, method_summaries, residual_analysis, geometry_summary,
-                     initialisation_results, robust_predictive, test_target, test_design,
-                     dataset['predictor_names'])
-    output_payload = {
-        'n_samples': POSTERIOR_SAMPLE_COUNT, 'burn_in': BURN_IN_COUNT, 'n_chains': CHAIN_COUNT,
-        'n_train': len(train_target), 'n_test': len(test_target),
-        'n_features': train_design.shape[1], 'ols_rmse': least_squares_rmse,
-        'nuts_draws': NUTS_DRAW_COUNT, 'nuts_tune': NUTS_TUNE_COUNT,
-        'methods': {name: {key: value for key, value in summary.items()}
-                    for name, summary in method_summaries.items()},
-        'robust_student_t': robust_summary,
-        'external_reference': external_reference,
-        'residual_analysis': {key: value for key, value in residual_analysis.items()
-                              if not isinstance(value, np.ndarray)},
-        'posterior_geometry': {key: value for key, value in geometry_summary.items()
-                               if not isinstance(value, np.ndarray)},
-        'initialisation_sensitivity': {
-            sampler_name: {start_name: {'iterations_to_stationarity':
-                                        entry['iterations_to_stationarity'],
-                                        'final_log_posterior': entry['final_log_posterior']}
-                           for start_name, entry in per_start.items()}
-            for sampler_name, per_start in initialisation_results.items()},
-    }
-    with open(RESULTS_FILE_PATH, 'w') as output_file:
-        json.dump(output_payload, output_file, indent=2)
-    print('\nSaved %s' % os.path.relpath(RESULTS_FILE_PATH, PROJECT_ROOT_DIRECTORY))
+def select_likelihood_on_validation(train, validation, target_std):
+    """Choose the likelihood and the degrees of freedom using validation data only."""
+    candidates = []
+    gaussian = gibbs_sampler(train['design'], train['target'], POSTERIOR_DRAWS, BURN_IN_DRAWS,
+                             random_seed=3)
+    gaussian_metrics = posterior_predictive_evaluation(
+        gaussian['coefficients'], gaussian['variances'], validation['design'],
+        validation['target'], target_std, random_seed=11)
+    candidates.append({'likelihood': 'Gaussian', 'degrees_of_freedom': None,
+                       'validation_log_density': gaussian_metrics['mean_log_predictive_density'],
+                       'validation_coverage_50': gaussian_metrics['coverage_50'],
+                       'validation_coverage_95': gaussian_metrics['coverage_95'],
+                       'validation_median_absolute_error':
+                           gaussian_metrics['median_absolute_error']})
+    print('    Gaussian            -> validation log density %.4f, 50%% coverage %.3f'
+          % (gaussian_metrics['mean_log_predictive_density'], gaussian_metrics['coverage_50']))
+    for degrees_of_freedom in STUDENT_T_GRID:
+        fitted = robust_student_t_gibbs(train['design'], train['target'], POSTERIOR_DRAWS,
+                                        BURN_IN_DRAWS, degrees_of_freedom, random_seed=3)
+        metrics = posterior_predictive_evaluation(
+            fitted['coefficients'], fitted['variances'], validation['design'],
+            validation['target'], target_std, random_seed=11,
+            degrees_of_freedom=degrees_of_freedom)
+        candidates.append({'likelihood': 'Student-t', 'degrees_of_freedom': degrees_of_freedom,
+                           'validation_log_density': metrics['mean_log_predictive_density'],
+                           'validation_coverage_50': metrics['coverage_50'],
+                           'validation_coverage_95': metrics['coverage_95'],
+                           'validation_median_absolute_error':
+                               metrics['median_absolute_error']})
+        print('    Student-t nu=%-5.1f -> validation log density %.4f, 50%% coverage %.3f'
+              % (degrees_of_freedom, metrics['mean_log_predictive_density'],
+                 metrics['coverage_50']))
+    best = max(candidates, key=lambda entry: entry['validation_log_density'])
+    return candidates, best
 
 
-def generate_figures(chain_storage, method_summaries, residual_analysis, geometry_summary,
-                     initialisation_results, robust_predictive, test_target, test_design,
-                     predictor_names):
-    method_names = [name for name in METHOD_ORDER if name in method_summaries]
-    preconditioning_pair = ['MH', 'Preconditioned MH']
+# --------------------------------------------------------------------------------------------
+# Figures
+# --------------------------------------------------------------------------------------------
+
+def generate_figures(chain_storage, summaries, residuals_test, geometry, initialisation,
+                     likelihood_candidates, hmc_grid, predictions, dataset, raw_frame_sample):
+    method_names = [name for name in GAUSSIAN_SAMPLERS if name in summaries]
+    converged_names = [name for name in method_names if summaries[name]['converged']]
+
+    figure, axes = plt.subplots(2, 3, figsize=(17, 9))
+    figure.suptitle('Telemetry distributions on a logarithmic count scale', fontsize=15,
+                    fontweight='bold')
+    columns = [('CPU_Usage_Pct', 'CPU usage (%)', False),
+               ('Mem_Usage_KB', 'Memory usage (KB)', True),
+               ('Disk_Read_KBps', 'Disk read (KB/s)', True),
+               ('Disk_Write_KBps', 'Disk write (KB/s)', True),
+               ('Net_Recv_KBps', 'Network received (KB/s)', True),
+               ('Net_Trans_KBps', 'Network transmitted (KB/s)', True)]
+    for axis, (column, label, use_log_x) in zip(axes.flat, columns):
+        values = raw_frame_sample[column].dropna().values
+        values = values[np.isfinite(values)]
+        if use_log_x:
+            positive = values[values > 0]
+            if len(positive):
+                bins = np.logspace(np.log10(max(positive.min(), 1e-3)),
+                                   np.log10(positive.max()), 60)
+                axis.hist(positive, bins=bins, color='steelblue', edgecolor='black',
+                          linewidth=0.3)
+                axis.set_xscale('log')
+        else:
+            axis.hist(values, bins=60, color='steelblue', edgecolor='black', linewidth=0.3)
+        axis.set_yscale('log')
+        axis.set_title(label)
+        axis.set_ylabel('Count (log scale)')
+    plt.tight_layout()
+    save_figure('fig_eda.png')
+
     figure, axes = plt.subplots(1, 3, figsize=(18, 5))
-    figure.suptitle('Why plain Metropolis-Hastings mixes badly: the posterior is anisotropic',
-                    fontsize=15, fontweight='bold')
-    correlation_image = axes[0].imshow(geometry_summary['correlation_matrix'], cmap='RdBu_r',
-                                       vmin=-1, vmax=1)
-    axes[0].set_title('Posterior correlation between coefficients')
-    axes[0].set_xticks(range(len(predictor_names) + 1))
-    axes[0].set_yticks(range(len(predictor_names) + 1))
-    short_labels = ['int'] + [name[:8] for name in predictor_names]
-    axes[0].set_xticklabels(short_labels, rotation=90, fontsize=8)
-    axes[0].set_yticklabels(short_labels, fontsize=8)
-    figure.colorbar(correlation_image, ax=axes[0], shrink=0.8)
-    axes[1].bar(preconditioning_pair,
-                [method_summaries[name]['avg_ess'] for name in preconditioning_pair],
-                color=[METHOD_COLORS[name] for name in preconditioning_pair], edgecolor='black')
-    axes[1].set_title('Effective sample size before and after preconditioning')
-    axes[1].set_ylabel('Average ESS (of %d draws)' % POSTERIOR_SAMPLE_COUNT)
-    for bar_index, method_name in enumerate(preconditioning_pair):
-        axes[1].text(bar_index, method_summaries[method_name]['avg_ess'],
-                     '%.0f' % method_summaries[method_name]['avg_ess'], ha='center', va='bottom')
-    for method_name in preconditioning_pair:
-        chain = chain_storage[method_name]['coefficients'][0][:, 0]
-        autocorrelations = autocorrelation_function(chain)[:300]
-        axes[2].plot(autocorrelations, label=method_name, color=METHOD_COLORS[method_name],
-                     linewidth=2)
-    axes[2].axhline(0.0, color='black', linewidth=1)
+    figure.suptitle('Posterior geometry and the effect of preconditioning', fontsize=15,
+                    fontweight='bold')
+    image = axes[0].imshow(geometry['correlation_matrix'], cmap='RdBu_r', vmin=-1, vmax=1)
+    labels = ['int'] + [name[:9] for name in dataset['predictor_names']]
+    axes[0].set_xticks(range(len(labels)))
+    axes[0].set_yticks(range(len(labels)))
+    axes[0].set_xticklabels(labels, rotation=90, fontsize=7)
+    axes[0].set_yticklabels(labels, fontsize=7)
+    axes[0].set_title('Posterior correlation of coefficients')
+    figure.colorbar(image, ax=axes[0], shrink=0.8)
+    pair = [name for name in ['MH', 'Preconditioned MH'] if name in summaries]
+    axes[1].bar(pair, [summaries[name]['min_bulk_ess'] for name in pair],
+                yerr=[summaries[name]['min_bulk_ess_sd'] for name in pair],
+                color=[METHOD_COLORS[name] for name in pair], edgecolor='black', capsize=6)
+    axes[1].set_yscale('log')
+    axes[1].set_title('Bulk ESS before and after preconditioning')
+    axes[1].set_ylabel('Bulk ESS (log scale), error bars over %d repeats' % REPEAT_COUNT)
+    for position, name in enumerate(pair):
+        axes[1].text(position, summaries[name]['min_bulk_ess'],
+                     '%.0f' % summaries[name]['min_bulk_ess'], ha='center', va='bottom')
+    for name in pair:
+        chain = chain_storage[name]['coefficients'][0][:, 0]
+        centered = chain - chain.mean()
+        autocorrelation = np.correlate(centered, centered, mode='full')[len(centered) - 1:]
+        autocorrelation = autocorrelation / autocorrelation[0]
+        axes[2].plot(autocorrelation[:300], label=name, color=METHOD_COLORS[name], linewidth=2)
+    axes[2].axhline(0, color='black', linewidth=1)
     axes[2].set_title('Autocorrelation of the intercept')
     axes[2].set_xlabel('Lag')
     axes[2].set_ylabel('ACF')
     axes[2].legend()
     plt.tight_layout()
-    plt.savefig(figure_path('v2_preconditioning.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    figure, axes = plt.subplots(1, 3, figsize=(18, 5))
-    figure.suptitle('The over-coverage is caused by heavy-tailed residuals, not by the priors',
-                    fontsize=15, fontweight='bold')
-    test_residuals = residual_analysis['test_residuals']
-    axes[0].hist(test_residuals, bins=120, density=True, alpha=0.7, color='steelblue',
-                 label='test residuals')
-    residual_grid = np.linspace(test_residuals.min(), test_residuals.max(), 400)
-    axes[0].plot(residual_grid, stats.norm.pdf(residual_grid, 0, residual_analysis['train_residual_sd']),
-                 'r--', linewidth=2, label='Gaussian fitted to sigma')
-    axes[0].set_yscale('log')
-    axes[0].set_title('Residual density (log scale)\nexcess kurtosis = %.0f'
-                      % residual_analysis['excess_kurtosis'])
-    axes[0].set_xlabel('Residual')
-    axes[0].legend()
-    stats.probplot(test_residuals, dist='norm', plot=axes[1])
-    axes[1].set_title('Normal Q-Q plot of the test residuals')
-    axes[1].get_lines()[0].set_markersize(2)
-    coverage_labels = ['50% interval', '95% interval']
-    gaussian_coverages = [method_summaries['Gibbs']['coverage_50'],
-                          method_summaries['Gibbs']['coverage_95']]
-    robust_coverages = [robust_predictive['coverage_50'], robust_predictive['coverage_95']]
-    bar_positions = np.arange(len(coverage_labels))
-    axes[2].bar(bar_positions - 0.2, gaussian_coverages, 0.4, label='Gaussian likelihood',
-                color='coral', edgecolor='black')
-    axes[2].bar(bar_positions + 0.2, robust_coverages, 0.4, label='Student-t likelihood',
-                color='seagreen', edgecolor='black')
-    axes[2].plot(bar_positions, [0.5, 0.95], 'k*', markersize=16, label='nominal level')
-    axes[2].set_xticks(bar_positions)
-    axes[2].set_xticklabels(coverage_labels)
-    axes[2].set_ylabel('Empirical coverage')
-    axes[2].set_title('Calibration before and after the robust likelihood')
-    axes[2].legend()
-    plt.tight_layout()
-    plt.savefig(figure_path('v2_calibration.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    figure, axes = plt.subplots(2, 2, figsize=(16, 10))
-    figure.suptitle('Sampler comparison with corrected diagnostics', fontsize=15, fontweight='bold')
-    comparison_metrics = [('Average ESS', [method_summaries[m]['avg_ess'] for m in method_names]),
-                          ('Runtime (s)', [method_summaries[m]['time'] for m in method_names]),
-                          ('ESS / second', [method_summaries[m]['ess_per_sec'] for m in method_names]),
-                          ('Split R-hat (intercept)',
-                           [method_summaries[m]['split_rhat']['Intercept'] for m in method_names])]
-    for axis, (metric_name, metric_values) in zip(axes.flat, comparison_metrics):
-        bars = axis.bar(method_names, metric_values,
-                        color=[METHOD_COLORS[m] for m in method_names], edgecolor='black')
-        axis.set_title(metric_name)
-        axis.tick_params(axis='x', rotation=20)
-        for bar, value in zip(bars, metric_values):
-            axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                      '%.4g' % value, ha='center', va='bottom', fontsize=10)
-        if metric_name in ('Average ESS', 'ESS / second'):
-            axis.set_yscale('log')
-    plt.tight_layout()
-    plt.savefig(figure_path('v2_comparison.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    if 'NUTS (PyMC)' in chain_storage:
-        figure, axes = plt.subplots(1, 2, figsize=(15, 6))
-        figure.suptitle('Validation against PyMC / NUTS', fontsize=15, fontweight='bold')
-        reference_means = np.vstack(chain_storage['NUTS (PyMC)']['coefficients']).mean(axis=0)
-        reference_sds = np.vstack(chain_storage['NUTS (PyMC)']['coefficients']).std(axis=0)
-        for method_name in method_names:
-            if method_name == 'NUTS (PyMC)':
-                continue
-            our_means = np.vstack(chain_storage[method_name]['coefficients']).mean(axis=0)
-            axes[0].scatter(reference_means, our_means, label=method_name,
-                            color=METHOD_COLORS[method_name], s=60, alpha=0.8)
-        axis_limits = [reference_means.min() - 0.05, reference_means.max() + 0.05]
-        axes[0].plot(axis_limits, axis_limits, 'k--', linewidth=1, label='exact agreement')
-        axes[0].set_xlabel('Posterior mean from PyMC / NUTS')
-        axes[0].set_ylabel('Posterior mean from our sampler')
-        axes[0].set_title('Posterior means agree with the reference implementation')
-        axes[0].legend()
-        for method_name in method_names:
-            if method_name == 'NUTS (PyMC)':
-                continue
-            our_means = np.vstack(chain_storage[method_name]['coefficients']).mean(axis=0)
-            standardised_difference = (our_means - reference_means) / reference_sds
-            axes[1].plot(range(len(our_means)), standardised_difference, 'o-',
-                         label=method_name, color=METHOD_COLORS[method_name])
-        axes[1].axhline(0.0, color='black', linewidth=1)
-        axes[1].axhline(0.1, color='red', linestyle=':', linewidth=1)
-        axes[1].axhline(-0.1, color='red', linestyle=':', linewidth=1)
-        axes[1].set_xlabel('Coefficient index')
-        axes[1].set_ylabel('(ours - NUTS) / posterior sd')
-        axes[1].set_title('Standardised difference from the reference')
-        axes[1].legend()
-        plt.tight_layout()
-        plt.savefig(figure_path('v2_nuts_validation.png'), dpi=150, bbox_inches='tight')
-        plt.close()
+    save_figure('fig_preconditioning.png')
 
     figure, axes = plt.subplots(1, 2, figsize=(16, 5.5))
-    figure.suptitle('Why the first round missed the problem: plain against split R-hat',
-                    fontsize=15, fontweight='bold')
-    checkpoints = np.arange(500, POSTERIOR_SAMPLE_COUNT + 1, 500)
-    for axis, (parameter_index, parameter_label) in zip(axes, [(0, 'Intercept'), (1, 'β₁')]):
-        for method_name in ['MH', 'Gibbs', 'HMC']:
-            if method_name not in chain_storage:
-                continue
-            plain_values, split_values = [], []
-            for checkpoint in checkpoints:
-                truncated = [chain[:checkpoint, parameter_index]
-                             for chain in chain_storage[method_name]['coefficients']]
-                plain_values.append(plain_potential_scale_reduction(truncated))
-                split_values.append(split_potential_scale_reduction(truncated))
-            axis.plot(checkpoints, plain_values, '--', color=METHOD_COLORS[method_name],
-                      linewidth=1.8, label='%s, plain R-hat' % method_name)
-            axis.plot(checkpoints, split_values, '-', color=METHOD_COLORS[method_name],
-                      linewidth=2.4, label='%s, split R-hat' % method_name)
-        axis.axhline(1.1, color='red', linestyle=':', linewidth=1.2, label='1.1 threshold')
-        axis.axhline(1.01, color='darkred', linestyle=':', linewidth=1.2, label='1.01 threshold')
-        axis.set_title('Convergence diagnostic for %s' % parameter_label)
-        axis.set_xlabel('Iterations used')
-        axis.set_ylabel('R-hat')
-        axis.set_yscale('log')
-        axis.legend(fontsize=8, ncol=2)
-    plt.tight_layout()
-    plt.savefig(figure_path('v2_rhat_comparison.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-    posterior_methods = [name for name in ['MH', 'Preconditioned MH', 'Gibbs', 'HMC']
-                         if name in chain_storage]
-    figure, axes = plt.subplots(2, 2, figsize=(15, 9))
-    figure.suptitle('Posterior distributions: where the samplers disagree', fontsize=15,
+    figure.suptitle('Convergence: rank-normalised R-hat and bulk ESS', fontsize=15,
                     fontweight='bold')
-    for axis, (parameter_index, parameter_label) in zip(
-            axes.flat, [(0, 'Intercept'), (1, 'β₁'), (3, 'β₃'), (None, 'σ²')]):
-        for method_name in posterior_methods:
-            if parameter_index is None:
-                values = np.concatenate(chain_storage[method_name]['variances'])
-            else:
-                values = np.vstack(chain_storage[method_name]['coefficients'])[:, parameter_index]
-            axis.hist(values, bins=80, density=True, alpha=0.45, label=method_name,
-                      color=METHOD_COLORS[method_name])
-        axis.set_title(parameter_label)
-        axis.set_ylabel('Density')
-        axis.legend(fontsize=9)
+    positions = np.arange(len(method_names))
+    axes[0].bar(positions, [summaries[name]['worst_rhat'] for name in method_names],
+                color=[METHOD_COLORS[name] for name in method_names], edgecolor='black')
+    axes[0].axhline(RHAT_THRESHOLD, color='darkred', linestyle=':', linewidth=1.5,
+                    label='threshold 1.01')
+    axes[0].set_yscale('log')
+    axes[0].set_xticks(positions)
+    axes[0].set_xticklabels(method_names, rotation=18, ha='right')
+    axes[0].set_ylabel('Worst R-hat over monitored parameters')
+    axes[0].set_title('Convergence diagnostic')
+    axes[0].legend()
+    axes[1].bar(positions, [summaries[name]['min_bulk_ess'] for name in method_names],
+                yerr=[summaries[name]['min_bulk_ess_sd'] for name in method_names],
+                color=[METHOD_COLORS[name] for name in method_names], edgecolor='black',
+                capsize=5)
+    axes[1].axhline(BULK_ESS_THRESHOLD, color='darkred', linestyle=':', linewidth=1.5,
+                    label='threshold 400')
+    axes[1].set_yscale('log')
+    axes[1].set_xticks(positions)
+    axes[1].set_xticklabels(method_names, rotation=18, ha='right')
+    axes[1].set_ylabel('Minimum bulk ESS')
+    axes[1].set_title('Effective sample size, error bars over %d repeats' % REPEAT_COUNT)
+    axes[1].legend()
     plt.tight_layout()
-    plt.savefig(figure_path('v2_posteriors.png'), dpi=150, bbox_inches='tight')
-    plt.close()
+    save_figure('fig_convergence.png')
 
-    figure, axes = plt.subplots(1, 2, figsize=(16, 5))
-    figure.suptitle('Autocorrelation and the noise variance trace', fontsize=15, fontweight='bold')
-    for method_name in posterior_methods:
-        autocorrelations = autocorrelation_function(
-            chain_storage[method_name]['coefficients'][0][:, 0])[:200]
-        axes[0].plot(autocorrelations, label=method_name, color=METHOD_COLORS[method_name],
-                     linewidth=2)
-    axes[0].axhline(0.0, color='black', linewidth=1)
-    axes[0].set_title('Autocorrelation of the intercept (chain 1)')
+    figure, axes = plt.subplots(2, 2, figsize=(15, 9))
+    figure.suptitle('Posterior distributions by sampler', fontsize=15, fontweight='bold')
+    panels = [('Intercept', 0), ('beta_1', 1), ('beta_3', 3), ('sigma2', None)]
+    for axis, (label, index) in zip(axes.flat, panels):
+        for name in method_names:
+            if index is None:
+                values = np.concatenate(chain_storage[name]['variances'])
+            else:
+                values = np.vstack(chain_storage[name]['coefficients'])[:, index]
+            axis.hist(values, bins=80, density=True, alpha=0.45, label=name,
+                      color=METHOD_COLORS[name])
+        axis.set_title(label)
+        axis.set_ylabel('Density')
+        axis.legend(fontsize=8)
+    plt.tight_layout()
+    save_figure('fig_posteriors.png')
+
+    figure, axes = plt.subplots(1, 2, figsize=(15, 5))
+    figure.suptitle('Residual diagnostics for the pooled linear model', fontsize=15,
+                    fontweight='bold')
+    autocorrelation = np.array(residuals_test['autocorrelation'])
+    axes[0].bar(range(1, len(autocorrelation)), autocorrelation[1:], color='steelblue')
+    confidence_band = 1.96 / np.sqrt(len(predictions['test_target']))
+    axes[0].axhline(confidence_band, color='red', linestyle='--', linewidth=1,
+                    label='95% band under independence')
+    axes[0].axhline(-confidence_band, color='red', linestyle='--', linewidth=1)
+    axes[0].set_title('Residual autocorrelation (test)\nLjung-Box p = %.3g'
+                      % residuals_test['ljung_box_p_value'])
     axes[0].set_xlabel('Lag')
     axes[0].set_ylabel('ACF')
     axes[0].legend(fontsize=9)
-    for method_name in posterior_methods:
-        axes[1].plot(chain_storage[method_name]['variances'][0][:2000], linewidth=0.6,
-                     alpha=0.8, label=method_name, color=METHOD_COLORS[method_name])
-    axes[1].set_title('Trace of the noise variance (first 2,000 retained draws)')
-    axes[1].set_xlabel('Iteration')
-    axes[1].set_ylabel('σ²')
+    test_residuals = predictions['test_target'] - predictions['gaussian_point_predictions']
+    stats.probplot(test_residuals, dist='norm', plot=axes[1])
+    axes[1].get_lines()[0].set_markersize(2)
+    axes[1].set_title('Normal Q-Q plot of test residuals\nexcess kurtosis = %.0f'
+                      % residuals_test['excess_kurtosis'])
+    plt.tight_layout()
+    save_figure('fig_residuals.png')
+
+    figure, axes = plt.subplots(1, 2, figsize=(15, 5))
+    figure.suptitle('Likelihood selection on the validation set', fontsize=15, fontweight='bold')
+    student_candidates = [entry for entry in likelihood_candidates
+                          if entry['likelihood'] == 'Student-t']
+    gaussian_candidate = [entry for entry in likelihood_candidates
+                          if entry['likelihood'] == 'Gaussian'][0]
+    degrees = [entry['degrees_of_freedom'] for entry in student_candidates]
+    axes[0].plot(degrees, [entry['validation_log_density'] for entry in student_candidates],
+                 'o-', color='seagreen', linewidth=2, label='Student-t')
+    axes[0].axhline(gaussian_candidate['validation_log_density'], color='coral',
+                    linestyle='--', linewidth=2, label='Gaussian')
+    axes[0].set_xscale('log')
+    axes[0].set_xlabel('Degrees of freedom nu')
+    axes[0].set_ylabel('Mean log predictive density (validation)')
+    axes[0].set_title('Selection criterion')
+    axes[0].legend()
+    axes[1].plot(degrees, [entry['validation_coverage_50'] for entry in student_candidates],
+                 'o-', color='seagreen', linewidth=2, label='Student-t, 50% interval')
+    axes[1].axhline(gaussian_candidate['validation_coverage_50'], color='coral', linestyle='--',
+                    linewidth=2, label='Gaussian, 50% interval')
+    axes[1].axhline(0.5, color='black', linestyle=':', linewidth=1.5, label='nominal 50%')
+    axes[1].set_xscale('log')
+    axes[1].set_xlabel('Degrees of freedom nu')
+    axes[1].set_ylabel('Validation coverage')
+    axes[1].set_title('Calibration across the grid')
     axes[1].legend(fontsize=9)
     plt.tight_layout()
-    plt.savefig(figure_path('v2_autocorrelation_and_variance.png'), dpi=150, bbox_inches='tight')
-    plt.close()
+    save_figure('fig_nu_selection.png')
 
-    sampler_names = list(initialisation_results.keys())
+    figure, axes = plt.subplots(1, 2, figsize=(15, 5))
+    figure.suptitle('Posterior predictive calibration on the test set', fontsize=15,
+                    fontweight='bold')
+    levels = ['50% interval', '95% interval']
+    gaussian_coverage = [predictions['gaussian']['coverage_50'],
+                         predictions['gaussian']['coverage_95']]
+    gaussian_bounds = [predictions['gaussian']['coverage_50_interval'],
+                       predictions['gaussian']['coverage_95_interval']]
+    robust_coverage = [predictions['robust']['coverage_50'], predictions['robust']['coverage_95']]
+    robust_bounds = [predictions['robust']['coverage_50_interval'],
+                     predictions['robust']['coverage_95_interval']]
+    positions = np.arange(2)
+    gaussian_errors = np.array([[c - b[0] for c, b in zip(gaussian_coverage, gaussian_bounds)],
+                                [b[1] - c for c, b in zip(gaussian_coverage, gaussian_bounds)]])
+    robust_errors = np.array([[c - b[0] for c, b in zip(robust_coverage, robust_bounds)],
+                              [b[1] - c for c, b in zip(robust_coverage, robust_bounds)]])
+    axes[0].bar(positions - 0.2, gaussian_coverage, 0.4, yerr=gaussian_errors, capsize=6,
+                label='Gaussian', color='coral', edgecolor='black')
+    axes[0].bar(positions + 0.2, robust_coverage, 0.4, yerr=robust_errors, capsize=6,
+                label='Student-t (nu=%.0f)' % predictions['selected_degrees_of_freedom'],
+                color='seagreen', edgecolor='black')
+    axes[0].plot(positions, [0.5, 0.95], 'k*', markersize=18, label='nominal level')
+    axes[0].set_xticks(positions)
+    axes[0].set_xticklabels(levels)
+    axes[0].set_ylabel('Empirical coverage')
+    axes[0].set_title('Coverage with block-bootstrap 95% intervals')
+    axes[0].legend(fontsize=9)
+    axes[1].bar(positions - 0.2, [predictions['gaussian']['width_50_percentage_points'],
+                                  predictions['gaussian']['width_95_percentage_points']],
+                0.4, label='Gaussian', color='coral', edgecolor='black')
+    axes[1].bar(positions + 0.2, [predictions['robust']['width_50_percentage_points'],
+                                  predictions['robust']['width_95_percentage_points']],
+                0.4, label='Student-t', color='seagreen', edgecolor='black')
+    axes[1].set_xticks(positions)
+    axes[1].set_xticklabels(levels)
+    axes[1].set_ylabel('Mean interval width (CPU percentage points)')
+    axes[1].set_title('Interval width in original units')
+    axes[1].legend(fontsize=9)
+    plt.tight_layout()
+    save_figure('fig_calibration.png')
+
+    figure, axes = plt.subplots(1, 2, figsize=(16, 5.5))
+    figure.suptitle('HMC sensitivity to step size and trajectory length', fontsize=15,
+                    fontweight='bold')
+    step_sizes = sorted({entry['step_size'] for entry in hmc_grid})
+    leapfrog_values = sorted({entry['leapfrog_steps'] for entry in hmc_grid})
+    efficiency = np.full((len(step_sizes), len(leapfrog_values)), np.nan)
+    acceptance = np.full((len(step_sizes), len(leapfrog_values)), np.nan)
+    for entry in hmc_grid:
+        row = step_sizes.index(entry['step_size'])
+        column = leapfrog_values.index(entry['leapfrog_steps'])
+        efficiency[row, column] = entry['bulk_ess_per_gradient']
+        acceptance[row, column] = entry['acceptance']
+    for axis, matrix, title, formatter in [
+            (axes[0], efficiency, 'Bulk ESS per gradient evaluation', '%.1e'),
+            (axes[1], acceptance, 'Acceptance rate', '%.2f')]:
+        image = axis.imshow(matrix, cmap='viridis', aspect='auto')
+        axis.set_xticks(range(len(leapfrog_values)))
+        axis.set_xticklabels(leapfrog_values)
+        axis.set_yticks(range(len(step_sizes)))
+        axis.set_yticklabels(step_sizes)
+        axis.set_xlabel('Leapfrog steps L')
+        axis.set_ylabel('Step size epsilon')
+        axis.set_title(title)
+        for row in range(len(step_sizes)):
+            for column in range(len(leapfrog_values)):
+                axis.text(column, row, formatter % matrix[row, column], ha='center',
+                          va='center', color='white', fontsize=9)
+        figure.colorbar(image, ax=axis, shrink=0.85)
+    plt.tight_layout()
+    save_figure('fig_hmc_sensitivity.png')
+
+    sampler_names = list(initialisation.keys())
     figure, axes = plt.subplots(1, len(sampler_names), figsize=(6 * len(sampler_names), 5))
     figure.suptitle('Effect of the starting point on convergence', fontsize=15, fontweight='bold')
     for axis, sampler_name in zip(np.atleast_1d(axes), sampler_names):
-        for start_name, entry in initialisation_results[sampler_name].items():
+        for start_name, entry in initialisation[sampler_name].items():
             axis.plot(entry['log_posterior_trace'], linewidth=1.5, label=start_name)
         axis.set_title(sampler_name)
         axis.set_xlabel('Iteration')
         axis.set_ylabel('Log posterior')
         axis.set_yscale('symlog')
-        axis.legend(fontsize=9)
+        axis.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(figure_path('v2_initialisation.png'), dpi=150, bbox_inches='tight')
-    plt.close()
+    save_figure('fig_initialisation.png')
+
+    figure, axis = plt.subplots(figsize=(14, 5.5))
+    shown = min(250, len(predictions['test_target']))
+    axis.plot(range(shown), predictions['test_target'][:shown] * dataset['target_std']
+              + dataset['target_mean'], 'k-', linewidth=1.2, label='Actual')
+    axis.plot(range(shown), predictions['gaussian_point_predictions'][:shown]
+              * dataset['target_std'] + dataset['target_mean'], color='coral', linewidth=1.2,
+              label='Predicted (Gaussian)')
+    axis.fill_between(range(shown),
+                      predictions['gaussian_lower_95'][:shown] * dataset['target_std']
+                      + dataset['target_mean'],
+                      predictions['gaussian_upper_95'][:shown] * dataset['target_std']
+                      + dataset['target_mean'], color='coral', alpha=0.2,
+                      label='95% posterior predictive interval')
+    axis.set_xlabel('Test observation index')
+    axis.set_ylabel('CPU usage (%)')
+    axis.set_title('One-step-ahead forecasts on the test set, original units')
+    axis.legend()
+    plt.tight_layout()
+    save_figure('fig_predictions.png')
+
+
+# --------------------------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------------------------
+
+def main():
+    skip_nuts = '--skip-nuts' in sys.argv
+    print('Loading data and building the forecasting design...')
+    dataset = load_and_prepare_data()
+    splits = dataset['splits']
+    train, validation, test = splits['train'], splits['validation'], splits['test']
+    print('  horizon %d minutes | train %d | validation %d | test %d | embargoed %d'
+          % (dataset['horizon_minutes'], len(train['target']), len(validation['target']),
+             len(test['target']), dataset['embargoed_count']))
+    least_squares = np.linalg.lstsq(train['design'], train['target'], rcond=None)[0]
+    residual_variance = float(np.mean((train['target'] - train['design'] @ least_squares) ** 2))
+    print('\nResidual diagnostics on the test split...')
+    residuals_test = residual_diagnostics(test['design'], test['target'], test['machine'],
+                                          dataset['target_std'])
+    print('  lag-1 ACF %.3f | Ljung-Box p %.3g | excess kurtosis %.1f'
+          % (residuals_test['lag1_autocorrelation'], residuals_test['ljung_box_p_value'],
+             residuals_test['excess_kurtosis']))
+    pooling_analysis = residual_diagnostics(train['design'], train['target'], train['machine'],
+                                            dataset['target_std'])
+    print('  per-VM residual sd on train ranges %.3f to %.3f (median %.3f) across %d machines'
+          % (pooling_analysis['per_machine_residual_sd_min'],
+             pooling_analysis['per_machine_residual_sd_max'],
+             pooling_analysis['per_machine_residual_sd_median'],
+             pooling_analysis['per_machine_count']))
+    geometry = posterior_geometry(train['design'], residual_variance)
+    print('\nPosterior geometry: condition number %.1f, max |correlation| %.3f'
+          % (geometry['condition_number'], geometry['max_absolute_correlation']))
+    sampler_specifications = [('MH', metropolis_hastings),
+                              ('Adaptive MH (naive)', adaptive_metropolis_hastings),
+                              ('Preconditioned MH', preconditioned_metropolis_hastings),
+                              ('Gibbs', gibbs_sampler),
+                              ('HMC', hamiltonian_monte_carlo)]
+    summaries, chain_storage = {}, {}
+    for name, function in sampler_specifications:
+        print('\nRunning %s: %d chains x %s draws, %d repeats...'
+              % (name, CHAIN_COUNT, '{:,}'.format(POSTERIOR_DRAWS), REPEAT_COUNT))
+        summary, coefficient_chains, variance_chains = run_sampler_repeatedly(
+            function, train['design'], train['target'], name)
+        summaries[name] = summary
+        chain_storage[name] = {'coefficients': coefficient_chains, 'variances': variance_chains}
+        print('  acceptance %.3f | R-hat %.4f | bulk ESS %.1f | tail ESS %.1f | %.1f s | %s'
+              % (summary['acceptance_rate'], summary['worst_rhat'], summary['min_bulk_ess'],
+                 summary['min_tail_ess'], summary['time'],
+                 'converged' if summary['converged'] else 'NOT converged'))
+    print('\nLonger run for Preconditioned MH (%s draws per chain)...'
+          % '{:,}'.format(LONG_RUN_DRAWS))
+    long_chains, long_variances, long_acceptances = [], [], []
+    started = time.time()
+    for chain_index in range(CHAIN_COUNT):
+        output = preconditioned_metropolis_hastings(train['design'], train['target'],
+                                                    LONG_RUN_DRAWS, BURN_IN_DRAWS,
+                                                    random_seed=500 + chain_index)
+        long_chains.append(output['coefficients'])
+        long_variances.append(output['variances'])
+        long_acceptances.append(output['acceptance_rate'])
+    long_summary = summarise_sampler(long_chains, long_variances, time.time() - started,
+                                     float(np.mean(long_acceptances)), 0, LONG_RUN_DRAWS)
+    print('  R-hat %.4f | bulk ESS %.1f | %s' % (long_summary['worst_rhat'],
+                                                 long_summary['min_bulk_ess'],
+                                                 'converged' if long_summary['converged']
+                                                 else 'still borderline'))
+    print('\nAnalytical reference by quadrature...')
+    analytical = analytical_posterior_reference(train['design'], train['target'])
+    analytical['largest_deviation_from_gibbs'] = float(max(
+        abs(a - b) for a, b in zip(analytical['posterior_mean_coefficients'],
+                                   summaries['Gibbs']['posterior_mean_coefficients'])))
+    print('  sigma^2 %.6f | largest deviation of Gibbs from the analytical mean %.6f'
+          % (analytical['posterior_mean_variance'], analytical['largest_deviation_from_gibbs']))
+    external = None
+    try:
+        print('\nExternal library reference (emcee)...')
+        external = run_emcee_reference(train['design'], train['target'])
+        external['largest_deviation_from_gibbs'] = float(max(
+            abs(a - b) for a, b in zip(external['posterior_mean_coefficients'],
+                                       summaries['Gibbs']['posterior_mean_coefficients'])))
+        print('  %s | %s draws in %.1f s | worst R-hat %.4f | min bulk ESS %.0f | deviation %.5f'
+              % (external['library'], '{:,}'.format(external['total_draws']), external['time'],
+                 external['worst_rhat'], external['minimum_bulk_ess'],
+                 external['largest_deviation_from_gibbs']))
+    except Exception as error:
+        print('  emcee reference failed: %s' % error)
+    arviz_check = cross_check_against_arviz(
+        [chain[:, 0] for chain in chain_storage['Gibbs']['coefficients']])
+    if arviz_check:
+        print('\nDiagnostic cross-check against ArviZ (Gibbs intercept):')
+        print('  R-hat ours %.5f vs ArviZ %.5f | bulk ESS ours %.1f vs ArviZ %.1f'
+              % (arviz_check['ours_rhat'], arviz_check['arviz_rhat'],
+                 arviz_check['ours_bulk_ess'], arviz_check['arviz_bulk_ess']))
+    print('\nSelecting the likelihood and nu on the validation split...')
+    likelihood_candidates, selected = select_likelihood_on_validation(train, validation,
+                                                                      dataset['target_std'])
+    print('  selected: %s%s' % (selected['likelihood'],
+                                '' if selected['degrees_of_freedom'] is None
+                                else ' with nu = %.0f' % selected['degrees_of_freedom']))
+    selected_degrees = selected['degrees_of_freedom'] if selected['likelihood'] == 'Student-t' \
+        else STUDENT_T_GRID[2]
+    print('\nFinal evaluation on the untouched test split...')
+    gaussian_fit = gibbs_sampler(train['design'], train['target'], POSTERIOR_DRAWS,
+                                 BURN_IN_DRAWS, random_seed=3)
+    gaussian_test = posterior_predictive_evaluation(
+        gaussian_fit['coefficients'], gaussian_fit['variances'], test['design'], test['target'],
+        dataset['target_std'], random_seed=21)
+    robust_fit = robust_student_t_gibbs(train['design'], train['target'], POSTERIOR_DRAWS,
+                                        BURN_IN_DRAWS, selected_degrees, random_seed=3)
+    robust_test = posterior_predictive_evaluation(
+        robust_fit['coefficients'], robust_fit['variances'], test['design'], test['target'],
+        dataset['target_std'], random_seed=21, degrees_of_freedom=selected_degrees)
+    print('  Gaussian : RMSE %.4f (%.3f pp) | median abs err %.4f (%.3f pp) | 50%% cov %.3f'
+          % (gaussian_test['rmse'], gaussian_test['rmse_percentage_points'],
+             gaussian_test['median_absolute_error'],
+             gaussian_test['median_absolute_error_percentage_points'],
+             gaussian_test['coverage_50']))
+    print('  Student-t: RMSE %.4f (%.3f pp) | median abs err %.4f (%.3f pp) | 50%% cov %.3f'
+          % (robust_test['rmse'], robust_test['rmse_percentage_points'],
+             robust_test['median_absolute_error'],
+             robust_test['median_absolute_error_percentage_points'],
+             robust_test['coverage_50']))
+    ols_predictions = test['design'] @ least_squares
+    ols_errors = test['target'] - ols_predictions
+    ols_metrics = {'rmse': float(np.sqrt(np.mean(ols_errors ** 2))),
+                   'median_absolute_error': float(np.median(np.abs(ols_errors))),
+                   'rmse_percentage_points': float(np.sqrt(np.mean(ols_errors ** 2))
+                                                   * dataset['target_std']),
+                   'median_absolute_error_percentage_points': float(
+                       np.median(np.abs(ols_errors)) * dataset['target_std'])}
+    print('  OLS      : RMSE %.4f (%.3f pp) | median abs err %.4f (%.3f pp)'
+          % (ols_metrics['rmse'], ols_metrics['rmse_percentage_points'],
+             ols_metrics['median_absolute_error'],
+             ols_metrics['median_absolute_error_percentage_points']))
+    print('\nHMC sensitivity grid over step size and leapfrog steps...')
+    warm_start = np.concatenate([least_squares, [np.log(residual_variance)]])
+    hmc_grid = hamiltonian_sensitivity_study(train['design'], train['target'], warm_start)
+    metropolis_grid = metropolis_sensitivity_study(train['design'], train['target'])
+    print('\nInitialisation study...')
+    initialisation = initialisation_study(train['design'], train['target'], least_squares)
+    for sampler_name, entries in initialisation.items():
+        for start_name, entry in entries.items():
+            print('  %-18s from %-20s -> %d iterations'
+                  % (sampler_name, start_name, entry['iterations_to_stationarity']))
+    predictive_draws = np.quantile(
+        (gaussian_fit['coefficients'][:2000] @ test['design'].T
+         + np.sqrt(gaussian_fit['variances'][:2000])[:, None]
+         * np.random.default_rng(5).normal(size=(2000, len(test['target'])))),
+        [0.025, 0.975], axis=0)
+    predictions = {'test_target': test['target'],
+                   'gaussian_point_predictions': gaussian_test['point_predictions'],
+                   'gaussian_lower_95': predictive_draws[0],
+                   'gaussian_upper_95': predictive_draws[1],
+                   'gaussian': gaussian_test, 'robust': robust_test,
+                   'selected_degrees_of_freedom': selected_degrees}
+    print('\nGenerating figures...')
+    raw_sample = pd.concat([pd.read_csv(path, sep=';\t', header=0, engine='python').rename(
+        columns=dict(zip(pd.read_csv(path, sep=';\t', header=0, engine='python').columns,
+                         TELEMETRY_COLUMNS)))
+        for path in sorted(glob.glob(os.path.join(DATA_DIRECTORY, '*.csv')))[:10]],
+        ignore_index=True)
+    generate_figures(chain_storage, summaries, residuals_test, geometry, initialisation,
+                     likelihood_candidates, hmc_grid, predictions, dataset, raw_sample)
+    payload = {
+        'configuration': {
+            'draws_per_chain': POSTERIOR_DRAWS, 'burn_in': BURN_IN_DRAWS,
+            'chains': CHAIN_COUNT, 'repeats': REPEAT_COUNT,
+            'long_run_draws': LONG_RUN_DRAWS,
+            'rhat_threshold': RHAT_THRESHOLD, 'bulk_ess_threshold': BULK_ESS_THRESHOLD,
+            'horizon_minutes': dataset['horizon_minutes'],
+            'bootstrap_block_length': BOOTSTRAP_BLOCK_LENGTH,
+            'bootstrap_replicates': BOOTSTRAP_REPLICATES,
+            'student_t_grid': STUDENT_T_GRID},
+        'data': {'n_train': int(len(train['target'])),
+                 'n_validation': int(len(validation['target'])),
+                 'n_test': int(len(test['target'])),
+                 'n_features': int(train['design'].shape[1]),
+                 'embargoed_count': dataset['embargoed_count'],
+                 'total_available_rows': dataset['total_available'],
+                 'distinct_machines': dataset['distinct_machines'],
+                 'target_std': dataset['target_std'], 'target_mean': dataset['target_mean'],
+                 'predictor_names': dataset['predictor_names']},
+        'samplers': {name: {key: value for key, value in summary.items()}
+                     for name, summary in summaries.items()},
+        'preconditioned_long_run': {key: value for key, value in long_summary.items()},
+        'analytical_reference': analytical,
+        'external_reference': external,
+        'arviz_cross_check': arviz_check,
+        'likelihood_selection': {'candidates': likelihood_candidates, 'selected': selected},
+        'test_performance': {
+            'gaussian': {k: v for k, v in gaussian_test.items() if k != 'point_predictions'},
+            'student_t': {k: v for k, v in robust_test.items() if k != 'point_predictions'},
+            'ols': ols_metrics},
+        'residual_diagnostics': residuals_test,
+        'pooling_analysis': {key: value for key, value in pooling_analysis.items()
+                             if key.startswith('per_machine') or key == 'residual_sd'},
+        'posterior_geometry': {k: v for k, v in geometry.items()
+                               if not isinstance(v, np.ndarray)},
+        'hmc_sensitivity': hmc_grid,
+        'mh_sensitivity': metropolis_grid,
+        'initialisation_sensitivity': {
+            sampler: {start: {'iterations_to_stationarity':
+                              entry['iterations_to_stationarity'],
+                              'stationary_level': entry['stationary_level']}
+                      for start, entry in entries.items()}
+            for sampler, entries in initialisation.items()},
+    }
+    with open(RESULTS_FILE, 'w') as handle:
+        json.dump(payload, handle, indent=2)
+    print('\nSaved experiment_results_v2.json')
 
 
 if __name__ == '__main__':
