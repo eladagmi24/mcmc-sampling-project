@@ -1,0 +1,16 @@
+# Core: the samplers, the data pipeline and the figures.
+numpy>=1.26
+scipy>=1.11
+pandas>=2.0
+matplotlib>=3.8
+
+# External reference sampler used for the validation in Section 5.4.
+emcee>=3.1
+
+# Document generation.
+python-docx>=1.1
+python-pptx>=0.6
+
+# Optional: a second external reference via NUTS. Skipped by --skip-nuts, which is the
+# recommended way to run the pipeline because PyMC needs a C++ compiler to be usable.
+# pymc>=5.10

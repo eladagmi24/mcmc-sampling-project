@@ -1,0 +1,17 @@
+# Input data. The Bitbrains fastStorage trace is 1.19 GB across 1,250 CSV files, which does
+# not belong in a source repository. See data/README.md for the download link and layout.
+data/*
+!data/README.md
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Office and OS scratch files
+~$*
+.DS_Store
+Thumbs.db
