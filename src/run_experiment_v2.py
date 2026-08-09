@@ -440,16 +440,24 @@ def hamiltonian_monte_carlo(design, target, draws, burn_in, random_seed=0,
             'density_evaluations': draws + burn_in}
 
 
-def robust_student_t_gibbs(design, target, draws, burn_in, degrees_of_freedom, random_seed=0):
+def robust_student_t_gibbs(design, target, draws, burn_in, degrees_of_freedom, random_seed=0,
+                           initial_parameters=None):
     """Student-t regression through the normal scale-mixture representation.
 
     y_i | beta, sigma^2, w_i ~ N(x_i' beta, sigma^2 / w_i) with w_i ~ Gamma(nu/2, nu/2) in
     shape-rate form marginalises to a Student-t with nu degrees of freedom and scale sigma.
+
+    Like the samplers targeting the Gaussian posterior, this one starts from an overdispersed
+    point unless told otherwise, so that several chains can be run and diagnosed on the same
+    footing as those in Section 5. The mixture weights always start at one, which corresponds to
+    the Gaussian special case and carries no information about the eventual solution.
     """
     generator = np.random.default_rng(random_seed)
     observation_count, coefficient_count = design.shape
-    coefficients = np.zeros(coefficient_count)
-    scale_squared = 1.0
+    start = dispersed_starting_point(coefficient_count + 1, random_seed) \
+        if initial_parameters is None else initial_parameters
+    coefficients = np.asarray(start[:coefficient_count], dtype=np.float64).copy()
+    scale_squared = float(np.exp(start[coefficient_count]))
     weights = np.ones(observation_count)
     coefficient_draws = np.zeros((draws, coefficient_count))
     scale_draws = np.zeros(draws)
@@ -1284,11 +1292,25 @@ def main():
     gaussian_test = posterior_predictive_evaluation(
         gaussian_fit['coefficients'], gaussian_fit['variances'], test['design'], test['target'],
         dataset['target_std'], random_seed=21)
-    robust_fit = robust_student_t_gibbs(train['design'], train['target'], POSTERIOR_DRAWS,
-                                        BURN_IN_DRAWS, selected_degrees, random_seed=3)
+    robust_coefficient_chains, robust_variance_chains = [], []
+    robust_started = time.time()
+    for chain_index in range(CHAIN_COUNT):
+        chain = robust_student_t_gibbs(train['design'], train['target'], POSTERIOR_DRAWS,
+                                       BURN_IN_DRAWS, selected_degrees,
+                                       random_seed=3 + chain_index)
+        robust_coefficient_chains.append(chain['coefficients'])
+        robust_variance_chains.append(chain['variances'])
+    student_t_diagnostics = summarise_sampler(robust_coefficient_chains, robust_variance_chains,
+                                              time.time() - robust_started, 1.0, 0,
+                                              POSTERIOR_DRAWS)
+    student_t_diagnostics['degrees_of_freedom'] = selected_degrees
+    print('  Student-t diagnostics: worst R-hat %.4f | min bulk ESS %.0f | converged %s'
+          % (student_t_diagnostics['worst_rhat'], student_t_diagnostics['min_bulk_ess'],
+             student_t_diagnostics['converged']))
     robust_test = posterior_predictive_evaluation(
-        robust_fit['coefficients'], robust_fit['variances'], test['design'], test['target'],
-        dataset['target_std'], random_seed=21, degrees_of_freedom=selected_degrees)
+        np.vstack(robust_coefficient_chains), np.concatenate(robust_variance_chains),
+        test['design'], test['target'], dataset['target_std'], random_seed=21,
+        degrees_of_freedom=selected_degrees)
     print('  Gaussian : RMSE %.4f (%.3f pp) | median abs err %.4f (%.3f pp) | 50%% cov %.3f'
           % (gaussian_test['rmse'], gaussian_test['rmse_percentage_points'],
              gaussian_test['median_absolute_error'],
@@ -1362,6 +1384,7 @@ def main():
         'samplers': {name: {key: value for key, value in summary.items()}
                      for name, summary in summaries.items()},
         'preconditioned_long_run': {key: value for key, value in long_summary.items()},
+        'student_t_diagnostics': {key: value for key, value in student_t_diagnostics.items()},
         'analytical_reference': analytical,
         'external_reference': external,
         'arviz_cross_check': arviz_check,

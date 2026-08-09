@@ -28,10 +28,10 @@ OUTPUT_FILE = os.path.join(DOCUMENT_DIRECTORY, 'Sampling_Project_Report.docx')
 GITHUB_REPOSITORY_URL = 'https://github.com/eladagmi24/mcmc-sampling-project'
 
 TITLE_PAGE_PLACEHOLDERS = {
-    'Institution': '[INSTITUTION - to be completed]',
-    'Course': '[COURSE NUMBER - to be completed]',
-    'Lecturer': '[LECTURER - to be completed]',
-    'Student IDs': '[STUDENT ID NUMBERS - to be completed]',
+    'Institution': '__________________________',
+    'Course': 'Advanced Methods in Machine Learning',
+    'Lecturer': 'Dr. Boaz Tamir',
+    'Student IDs': '__________________________',
 }
 
 with open(RESULTS_FILE, 'r') as handle:
@@ -279,9 +279,11 @@ def add_code_block(lines):
         run.font.size = Pt(9)
 
 
-def add_field(paragraph, instruction):
+def add_field(paragraph, instruction, dirty=False):
     begin = OxmlElement('w:fldChar')
     begin.set(qn('w:fldCharType'), 'begin')
+    if dirty:
+        begin.set(qn('w:dirty'), 'true')
     instruction_element = OxmlElement('w:instrText')
     instruction_element.set(qn('xml:space'), 'preserve')
     instruction_element.text = instruction
@@ -395,10 +397,7 @@ document.add_page_break()
 
 add_heading('Table of Contents', level=1)
 contents_paragraph = document.add_paragraph()
-add_field(contents_paragraph, r' TOC \o "1-3" \h \z \u ')
-add_paragraph('If the entries above appear empty, open the document in Word and press '
-              'Ctrl+A then F9 to build the table of contents with page numbers and links.',
-              italic=True, size=9)
+add_field(contents_paragraph, r' TOC \o "1-3" \h \z \u ', dirty=True)
 
 document.add_page_break()
 
@@ -944,6 +943,16 @@ add_paragraph(
     'against one another and neither is interpretable alone. Efficiency is reported as bulk ESS '
     'per gradient evaluation, which is the natural currency for a gradient method, alongside '
     'acceptance rate and R-hat.')
+add_paragraph(
+    'The grid runs differ from the main experiment in one respect that should be stated. They are '
+    'warm started at the least-squares fit with small random perturbations, rather than from the '
+    'overdispersed points used in Section 5.2. Short runs from dispersed starts would spend most '
+    'of their length travelling to the posterior, so the resulting diagnostics would measure '
+    'burn-in rather than the effect of the tuning parameters, which is what the grid is meant to '
+    'isolate. The cost of that choice is that split R-hat is a weaker guarantee here than in '
+    'Table 4, because chains that begin close together can agree without having explored the '
+    'posterior. The grid should therefore be read as ranking configurations against one another, '
+    'not as certifying any of them as converged.')
 grid_rows = []
 for cell in hmc_grid:
     grid_rows.append(('%.3f' % cell['step_size'], str(cell['leapfrog_steps']),
@@ -1093,6 +1102,23 @@ add_paragraph(
     'The test split is used here and nowhere else. Errors are reported both in standardised units '
     'and in CPU percentage points, obtained by multiplying by the training standard deviation of '
     'the target, %.3f percentage points.' % data_summary['target_std'])
+STUDENT_DIAGNOSTICS = results.get('student_t_diagnostics')
+if STUDENT_DIAGNOSTICS:
+    add_paragraph(
+        'The Student-t model is held to the same standard as the samplers in Section 5. It is '
+        'fitted with %d chains from overdispersed starting points and diagnosed with the same '
+        'estimators and the same worst-case aggregation, giving R-hat %.4f and minimum bulk ESS '
+        '%.0f, which %s the criterion of R-hat below %.2f and bulk ESS at least %.0f used '
+        'throughout. Every Student-t number reported in this section comes from those %d chains '
+        'pooled, not from a single run. This matters because the argument of Section 5 is that a '
+        'sampler which has not been diagnosed cannot support conclusions, and that argument '
+        'applies to the model used for the predictive results just as much as to the ones being '
+        'compared.'
+        % (configuration['chains'], STUDENT_DIAGNOSTICS['worst_rhat'],
+           STUDENT_DIAGNOSTICS['min_bulk_ess'],
+           'meets' if STUDENT_DIAGNOSTICS['converged'] else 'does not meet',
+           configuration['rhat_threshold'], configuration['bulk_ess_threshold'],
+           configuration['chains']))
 accuracy_rows = [
     ('OLS baseline', '%.4f' % OLS_TEST['rmse'], '%.3f' % OLS_TEST['rmse_percentage_points'],
      '%.4f' % OLS_TEST['median_absolute_error'],

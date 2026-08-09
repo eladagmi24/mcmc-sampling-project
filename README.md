@@ -20,40 +20,52 @@ library used inside any of them:
 
 | Sampler | Idea | Result on this posterior |
 |---|---|---|
-| Metropolis-Hastings | isotropic random walk | **did not converge** in 10,000 draws |
-| Adaptive MH | proposal covariance learned from the chain | **failed**, 1.2% acceptance |
-| Preconditioned MH | proposal shaped by the observed Fisher information | works, ESS 217 |
-| Gibbs | exact full conditionals from conjugacy | best ESS per second |
-| HMC | gradient-informed, leapfrog integrator | ESS 7,997 |
-| Student-t Gibbs | robust likelihood as a normal scale mixture | fixes the calibration |
+| Metropolis-Hastings | isotropic random walk | **did not converge**, R-hat 4.40 |
+| Adaptive MH | proposal covariance learned from the chain | **did not converge**, 1.1% acceptance |
+| Preconditioned MH | proposal shaped by the observed Fisher information | converged, bulk ESS 627 |
+| Gibbs | exact full conditionals | converged, best ESS per second |
+| HMC | gradient-informed, leapfrog integrator | converged, bulk ESS 15,905 |
+| Student-t Gibbs | robust likelihood as a normal scale mixture | improves the calibration substantially |
 
 ## Main findings
 
-**Plain Metropolis-Hastings never converged, and a weak diagnostic hid it.** Under the plain
-Gelman-Rubin statistic every sampler scored 1.03 or below, which reads as convergence. Split R-hat
-puts MH at 1.47, and its posterior means are wrong by up to 0.315 — larger than the standard
-deviation of the widest direction of the posterior (0.044).
+Every number below is read from `results/experiment_results_v2.json` produced by the current run
+and matches the shipped report. The earlier round of experiments, and the corrections that led
+here, are preserved in [`docs/PROJECT_STATUS_AND_FINDINGS.md`](docs/PROJECT_STATUS_AND_FINDINGS.md)
+and [`docs/archive/`](docs/archive/).
 
-**The cause is geometric, not generic.** The posterior covariance has condition number 273 and a
-maximum coefficient correlation of 0.77, because the lagged CPU features are nearly collinear. A
-single isotropic step size has to fit a direction of width 0.0027 while crossing one of width
-0.044.
+**Two of the five samplers never converged.** With 4 overdispersed chains and
+rank-normalised, folded R-hat, plain Metropolis-Hastings reaches R-hat 4.40 and adaptive
+Metropolis 3.35, against a threshold of 1.01. Their posterior means are wrong by
+1.36 and 1.44 against a deterministic quadrature reference — larger than the standard
+deviation of the widest direction of the posterior (0.050), so the errors exceed the entire
+posterior spread.
 
-**Textbook adaptive Metropolis fails here, and the reason is instructive.** Learning the proposal
-covariance from the chain's own history cannot work when the chain has an autocorrelation time of
-~1,000 and only 2,000 burn-in iterations: it measures the transient drift toward the mode rather
-than the posterior. Supplying the metric externally, from the observed Fisher information, raises
-ESS from 9.3 to 217 and brings acceptance to 27.5% against the theoretical optimum of 23.4%.
+**The cause is geometric, not generic.** The posterior covariance has condition number
+314 and a maximum coefficient correlation of 0.69, because the lagged CPU features
+are nearly collinear. A single isotropic step size has to fit a direction of width 0.0028
+while crossing one of width 0.0499.
 
-**The over-wide credible intervals were blamed on the priors; they are caused by the data.** The
-test residuals have an excess kurtosis of 108.9. A plain OLS fit, with no priors and no MCMC,
-reproduces the same over-coverage. A Student-t likelihood sampled as a normal scale mixture moves
-50% interval coverage from 94.5% to 73.7% against a nominal 50%, narrows the mean 50% interval
-from 0.534 to 0.068, and cuts the median absolute error from 0.046 to 0.019.
+**Textbook adaptive Metropolis fails under the configuration tested, and the reason is
+instructive.** Learning the proposal covariance from the chain's own history cannot work when the
+chain barely moves during the 2,000 burn-in iterations available: it measures the transient
+drift toward the mode rather than the posterior, and acceptance collapses to 1.1%. Supplying the
+metric externally, from the observed Fisher information, raises bulk ESS from 4.2 to
+627 and brings acceptance to 24.6% against the theoretical optimum of 23.4%.
 
-**Validation.** Gibbs, HMC and preconditioned MH agree on the posterior means to within 0.0006.
-The same posterior sampled with [emcee](https://emcee.readthedocs.io), a third-party library using
-an unrelated ensemble algorithm, agrees to within 0.0008.
+**The over-wide predictive intervals are caused by the data, not the priors.** The test residuals
+have an excess kurtosis of 111. A plain OLS fit, with no priors and no MCMC, reproduces the
+same over-coverage. A Student-t likelihood sampled as a normal scale mixture, with nu selected on
+validation data, moves nominal 50% interval coverage from 94.7% to 74.1% and cuts the median
+absolute error from 0.210 to 0.072 CPU percentage points. That is a substantial
+improvement rather than a fix: at 74.1% against a nominal 50% the intervals remain clearly
+miscalibrated, and the report says so.
+
+**Validation.** Gibbs, HMC and preconditioned MH agree with a deterministic quadrature reference,
+which involves no sampling at all, to within 0.0025. The same posterior sampled with
+[emcee](https://emcee.readthedocs.io), a third-party library using an unrelated ensemble
+algorithm, agrees to within 0.00112. The Student-t model is diagnosed on the same footing:
+4 chains, R-hat 1.0012, minimum bulk ESS 2272.
 
 ## Repository layout
 
@@ -88,9 +100,13 @@ mcmc-sampling-project/
 pip install -r requirements.txt
 
 # download the data first (see data/README.md), then, from the repository root:
-python src/run_experiment_v2.py --skip-nuts   # ~1 minute -> results/ JSON + figures
-python src/create_report_v2.py                # -> docs/Sampling_Project_Report.docx
+python src/run_experiment_v2.py --skip-nuts   # ~18 minutes -> results/ JSON + figures
+python src/create_report_v2.py                # a few seconds -> docs/Sampling_Project_Report.docx
 ```
+
+The experiment took about 18 minutes on the machine used for the current results. Most of that is
+Hamiltonian Monte Carlo, which is run for 4 chains and 3 independent repeats, and the emcee
+reference; the figure varies with machine load.
 
 Every number and figure in the report is produced by these two commands. Nothing is hand-copied.
 The scripts resolve their own paths, so they can be run from any working directory.
