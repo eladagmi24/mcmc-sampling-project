@@ -6,7 +6,7 @@ All experiments were rerun from scratch and the report regenerated from
 Reproduce with:
 
 ```
-python src/run_experiment_v2.py --skip-nuts     # ~4 minutes
+python src/run_experiment_v2.py --skip-nuts     # ~18 minutes
 python src/create_report_v2.py
 ```
 
@@ -25,7 +25,7 @@ python src/create_report_v2.py
 | Justify 5,000 of ~430,000 observations | Done — §3.4, computational, with the consequence for test-set precision stated |
 | No leakage across splits | Done — embargo drops any row whose 6-step feature window crosses a boundary (632 rows) |
 | Residual autocorrelation diagnostic | Done — ACF plus Ljung-Box, §6.4 and Figure 8 |
-| Discussion of pooling 50 VMs | Done — §3.5, per-VM residual sd ranges 0.035–1.026 against a pooled 0.353 |
+| Discussion of pooling 50 VMs | Done — §3.5, per-VM residual sd ranges 0.000–1.575 (median 0.049) across 48 machines against a pooled 0.349 |
 
 Note on VM leakage: the same machine appears in several splits at different times. That is the
 intended design for time-series forecasting, and §3.3 states explicitly that results describe
@@ -59,7 +59,7 @@ indicator, which is degenerate. Both affected the previously reported ESS values
 | Clarify what emcee does and does not validate | Done — §5.5 uses the suggested wording |
 | Replace the "proves the model is correct" claim | Done |
 | Add an independent reference for likelihood and priors | Done — **a deterministic analytical reference**, not another sampler |
-| Report emcee convergence diagnostics | Done — R-hat 1.0208, min bulk ESS 1,982, plus a caveat that this is above our own threshold |
+| Report emcee convergence diagnostics | Done — R-hat 1.0224, min bulk ESS 1,885, plus a caveat that this is above our own threshold |
 
 The analytical reference marginalises β in closed form (`y | σ² ~ N(0, σ²I + τ²XX')`, via
 Sylvester and Woodbury) and integrates the remaining 1-D density over σ² on a 6,000-point grid.
@@ -93,7 +93,7 @@ any sampler. Gibbs reproduces it to within 1.4×10⁻⁴.
   replicates.
 - Coverage reported with **moving-block bootstrap** 95% intervals (block 50, 2,000 replicates).
 - ν selected on validation data over a grid; sensitivity shown in Figure 6.
-- Described as a **partial improvement**: Gaussian 94.7% → Student-t 74.6% against a nominal 50%
+- Described as a **partial improvement**: Gaussian 94.7% → Student-t 74.1% against a nominal 50%
   is still about 1.5× too wide, and the report says so.
 
 ## 7. Sensitivity analyses
@@ -145,13 +145,31 @@ any sampler. Gibbs reproduces it to within 1.4×10⁻⁴.
 
 ---
 
+## Follow-up round: Student-t diagnostics, title page, README sync
+
+- `robust_student_t_gibbs` now accepts `initial_parameters` and starts from an overdispersed point
+  by default, matching the Gaussian samplers. Mixture weights still start at one.
+- The selected Student-t model is fitted with 4 dispersed chains and diagnosed with the same
+  `summarise_sampler` helper, thresholds and worst-case aggregation as Section 5: R-hat 1.0012,
+  minimum bulk ESS 2272, converged True. Section 6 now reports those chains **pooled**, so its
+  numbers moved in the third or fourth decimal.
+- Section 6.3 states the Student-t diagnostics explicitly, so the model behind the headline
+  predictive numbers is held to the project's own standard.
+- Section 5.6 now discloses that the HMC grid is warm started rather than dispersed, and that it
+  ranks configurations rather than certifying them.
+- Title page: course and lecturer filled in; institution and student IDs left as blanks to be
+  completed by hand.
+- The table of contents field is marked dirty, so Word rebuilds it on open with no keypress.
+- README numbers regenerated from the current results file; the "fixes the calibration" phrasing
+  softened to match the report, which is careful that the intervals remain miscalibrated.
+
 ## Open items
 
-1. **Title page metadata** — institution, course number, lecturer and student IDs are not known to
-   me, so they appear as bracketed placeholders rather than invented values. Edit
-   `TITLE_PAGE_PLACEHOLDERS` at the top of `src/create_report_v2.py`.
-2. **The TOC needs one keypress in Word.** python-docx can insert the field but cannot compute
-   page numbers. Open the document and press Ctrl+A then F9. A note in the document says so.
+1. **Title page** — course and lecturer are filled in. Institution and student ID numbers remain
+   underscore blanks, since I do not know them; fill them in directly or edit
+   `TITLE_PAGE_PLACEHOLDERS` in `src/create_report_v2.py`.
+2. **The TOC is built by Word on open.** The field is marked dirty, so Word rebuilds it with page
+   numbers and links when the document is opened; no user action is needed.
 3. **No visual page-by-page inspection.** The document was verified structurally by parsing its
    XML (page breaks, fields, header rows, alt text, no stray format specifiers). Rendering to PDF
    requires Word or LibreOffice, neither of which is available here, so orphaned headers and
