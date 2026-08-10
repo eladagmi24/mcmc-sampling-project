@@ -74,7 +74,12 @@ BOOTSTRAP_REPLICATES = 2000
 GAUSSIAN_SAMPLERS = ['MH', 'Adaptive MH (naive)', 'Preconditioned MH', 'Gibbs', 'HMC']
 METHOD_COLORS = {'MH': 'steelblue', 'Adaptive MH (naive)': 'firebrick',
                  'Preconditioned MH': 'darkorange', 'Gibbs': 'coral', 'HMC': 'seagreen'}
-REPORTED_PARAMETERS = [('Intercept', 0), ('beta_1', 1), ('beta_3', 3)]
+REPORTED_PARAMETERS = [
+    ('Intercept', 0), ('Mem_Usage_KB_lag1', 1), ('Disk_Read_KBps_lag1', 2),
+    ('Disk_Write_KBps_lag1', 3), ('Net_Recv_KBps_lag1', 4),
+    ('Net_Trans_KBps_lag1', 5), ('CPU_lag_1', 6), ('CPU_lag_2', 7),
+    ('CPU_lag_3', 8), ('CPU_rolling_mean', 9), ('CPU_rolling_std', 10),
+]
 
 
 # --------------------------------------------------------------------------------------------
@@ -105,6 +110,10 @@ def load_and_prepare_data():
         frame = combined[combined['VM_ID'] == machine_identifier].sort_values('Datetime').copy()
         if len(frame) < 50:
             continue
+        # Lagged features are computed within this single-machine frame. shift()
+        # operates per-machine, so no row from another machine leaks into a lag.
+        # dropna() below removes the first rows where the lag / rolling window is
+        # undefined, preventing cross-machine contamination at boundaries.
         for column in exogenous_columns:
             frame['%s_lag1' % column] = frame[column].shift(FORECAST_HORIZON_STEPS)
         for lag in [1, 2, 3]:
@@ -360,10 +369,11 @@ def preconditioned_metropolis_hastings(design, target, draws, burn_in, random_se
 
 
 def gibbs_sampler(design, target, draws, burn_in, random_seed=0, initial_parameters=None):
-    """Full conditionals: beta is Gaussian, sigma^2 is Inverse-Gamma in shape-rate form.
+    """Full conditionals: beta is Gaussian; 1/sigma^2 ~ Gamma(a0, rate=b0), equivalently
+    sigma^2 ~ Inverse-Gamma(a0, scale=b0).
 
-    numpy draws Gamma with a scale argument, so the rate b_n is passed as 1/b_n and the result
-    inverted to obtain the Inverse-Gamma draw.
+    NumPy draws Gamma with a scale argument, so the rate b_n is passed as 1/b_n and the
+    result inverted to obtain the Inverse-Gamma draw.
     """
     generator = np.random.default_rng(random_seed)
     observation_count, coefficient_count = design.shape
@@ -392,7 +402,7 @@ def gibbs_sampler(design, target, draws, burn_in, random_seed=0, initial_paramet
             coefficient_draws[index - burn_in] = coefficients
             variance_draws[index - burn_in] = noise_variance
     return {'coefficients': coefficient_draws, 'variances': variance_draws,
-            'acceptance_rate': 1.0, 'log_posterior': trace, 'gradient_evaluations': 0,
+            'acceptance_rate': None, 'log_posterior': trace, 'gradient_evaluations': 0,
             'density_evaluations': draws + burn_in}
 
 
@@ -478,7 +488,7 @@ def robust_student_t_gibbs(design, target, draws, burn_in, degrees_of_freedom, r
         if index >= burn_in:
             coefficient_draws[index - burn_in] = coefficients
             scale_draws[index - burn_in] = scale_squared
-    return {'coefficients': coefficient_draws, 'variances': scale_draws, 'acceptance_rate': 1.0}
+    return {'coefficients': coefficient_draws, 'variances': scale_draws, 'acceptance_rate': None}
 
 
 # --------------------------------------------------------------------------------------------
@@ -594,7 +604,9 @@ def summarise_sampler(coefficient_chains, variance_chains, elapsed_time, accepta
                                'bulk_ess': bulk_effective_sample_size(variance_chains),
                                'tail_ess': tail_effective_sample_size(variance_chains),
                                'mcse': monte_carlo_standard_error(variance_chains)}
-    worst_rhat = max(entry['rhat'] for entry in per_parameter.values())
+    rhat_values = [entry['rhat'] for entry in per_parameter.values()
+                   if entry['rhat'] is not None]
+    worst_rhat = max(rhat_values) if rhat_values else None
     minimum_bulk = min(entry['bulk_ess'] for entry in per_parameter.values())
     minimum_tail = min(entry['tail_ess'] for entry in per_parameter.values())
     total_draws = draws_per_chain * len(coefficient_chains)
@@ -607,13 +619,16 @@ def summarise_sampler(coefficient_chains, variance_chains, elapsed_time, accepta
             'gradient_evaluations': gradient_evaluations,
             'mcse_intercept': per_parameter['Intercept']['mcse'],
             'per_parameter': per_parameter,
-            'converged': bool(worst_rhat < RHAT_THRESHOLD and minimum_bulk >= BULK_ESS_THRESHOLD),
+            'converged': bool(worst_rhat is not None
+                              and worst_rhat < RHAT_THRESHOLD
+                              and minimum_bulk >= BULK_ESS_THRESHOLD),
             'posterior_mean_coefficients': np.vstack(coefficient_chains).mean(axis=0).tolist(),
             'posterior_mean_variance': float(np.concatenate(variance_chains).mean())}
 
 
 def posterior_predictive_evaluation(coefficient_draws, variance_draws, design, target,
-                                    target_std, random_seed=0, degrees_of_freedom=None):
+                                    target_std, machine_labels=None, random_seed=0,
+                                    degrees_of_freedom=None):
     """Posterior predictive intervals.
 
     For each retained draw (beta_s, sigma^2_s) a replicate observation is generated as
@@ -651,7 +666,12 @@ def posterior_predictive_evaluation(coefficient_draws, variance_draws, design, t
         results['coverage_%d' % key] = float(inside.mean())
         results['width_%d' % key] = float(np.mean(upper - lower))
         results['width_%d_percentage_points' % key] = float(np.mean(upper - lower) * target_std)
-        results['coverage_%d_interval' % key] = block_bootstrap_interval(inside, random_seed)
+        if machine_labels is not None:
+            results['coverage_%d_interval' % key] = cluster_bootstrap_interval(
+                inside, machine_labels, random_seed)
+        else:
+            results['coverage_%d_interval' % key] = block_bootstrap_interval(
+                inside, random_seed)
     results['mean_log_predictive_density'] = log_density
     return results
 
@@ -694,38 +714,92 @@ def block_bootstrap_interval(indicator, random_seed=0):
     return [float(np.quantile(estimates, 0.025)), float(np.quantile(estimates, 0.975))]
 
 
+def cluster_bootstrap_interval(indicator, machine_labels, random_seed=0):
+    """Cluster bootstrap: resample machines with replacement, keeping each machine's
+    observations intact. This respects the panel structure of the data.
+    """
+    generator = np.random.default_rng(random_seed + 991)
+    unique_machines = np.unique(machine_labels)
+    machine_count = len(unique_machines)
+    machine_indicators = {m: indicator[machine_labels == m] for m in unique_machines}
+    estimates = np.empty(BOOTSTRAP_REPLICATES)
+    for replicate in range(BOOTSTRAP_REPLICATES):
+        selected = generator.choice(unique_machines, size=machine_count, replace=True)
+        pooled = np.concatenate([machine_indicators[m] for m in selected])
+        estimates[replicate] = pooled.mean()
+    return [float(np.quantile(estimates, 0.025)),
+            float(np.quantile(estimates, 0.975))]
+
+
 def residual_diagnostics(design, target, machine_labels, target_std, maximum_lag=40):
+    """Per-machine residual diagnostics.
+
+    Autocorrelation and the Ljung-Box test are computed within each machine, never across
+    machine boundaries. The aggregate reports the median lag-1 ACF, the distribution of
+    Ljung-Box p-values, and the fraction of machines that reject independence at 5%.
+    """
     least_squares = np.linalg.lstsq(design, target, rcond=None)[0]
     residuals = target - design @ least_squares
-    centered = residuals - residuals.mean()
-    autocorrelation = np.correlate(centered, centered, mode='full')[len(centered) - 1:]
-    autocorrelation = autocorrelation / autocorrelation[0]
-    length = len(residuals)
-    lags = np.arange(1, maximum_lag + 1)
-    statistic = length * (length + 2) * np.sum(
-        autocorrelation[1:maximum_lag + 1] ** 2 / (length - lags))
+    unique_machines = np.unique(machine_labels)
+    per_machine_lag1 = []
+    per_machine_ljung_box_p = []
     per_machine_std = []
-    for machine in np.unique(machine_labels):
+    per_machine_acf = []
+    for machine in unique_machines:
         mask = machine_labels == machine
-        if mask.sum() >= 10:
-            per_machine_std.append(float(residuals[mask].std()))
+        machine_residuals = residuals[mask]
+        n = len(machine_residuals)
+        if n < 10:
+            continue
+        per_machine_std.append(float(machine_residuals.std()))
+        usable_lags = min(maximum_lag, max(1, n // 3))
+        if usable_lags < 2 or n < 6:
+            continue
+        centered = machine_residuals - machine_residuals.mean()
+        acf_full = np.correlate(centered, centered, mode='full')[n - 1:]
+        if acf_full[0] > 0:
+            acf_full = acf_full / acf_full[0]
+        else:
+            acf_full = np.zeros_like(acf_full)
+        per_machine_lag1.append(float(acf_full[1]))
+        padded = np.full(maximum_lag + 1, np.nan)
+        padded[:min(len(acf_full), maximum_lag + 1)] = acf_full[:maximum_lag + 1]
+        per_machine_acf.append(padded)
+        lag_range = np.arange(1, usable_lags + 1)
+        statistic = n * (n + 2) * np.sum(
+            acf_full[1:usable_lags + 1] ** 2 / (n - lag_range))
+        per_machine_ljung_box_p.append(float(stats.chi2.sf(statistic, usable_lags)))
     if not per_machine_std:
         per_machine_std = [float(residuals.std())]
-    return {'autocorrelation': autocorrelation[:maximum_lag + 1].tolist(),
-            'ljung_box_statistic': float(statistic), 'ljung_box_lags': int(maximum_lag),
-            'ljung_box_p_value': float(stats.chi2.sf(statistic, maximum_lag)),
-            'lag1_autocorrelation': float(autocorrelation[1]),
-            'excess_kurtosis': float(stats.kurtosis(residuals)),
-            'skewness': float(stats.skew(residuals)),
-            'residual_sd': float(residuals.std()),
-            'residual_mad': float(np.median(np.abs(residuals))),
-            'sd_to_robust_sd_ratio': float(residuals.std()
-                                           / (1.4826 * np.median(np.abs(residuals)))),
-            'per_machine_residual_sd_min': float(np.min(per_machine_std)),
-            'per_machine_residual_sd_max': float(np.max(per_machine_std)),
-            'per_machine_residual_sd_median': float(np.median(per_machine_std)),
-            'per_machine_count': len(per_machine_std),
-            'pooled_residual_sd_percentage_points': float(residuals.std() * target_std)}
+    rejecting = sum(1 for p in per_machine_ljung_box_p if p < 0.05)
+    machines_tested = len(per_machine_lag1)
+    median_acf_by_lag = (np.nanmedian(per_machine_acf, axis=0).tolist()
+                         if per_machine_acf else [])
+    robust_mad = np.median(np.abs(residuals))
+    return {
+        'median_lag1_acf': (float(np.median(per_machine_lag1))
+                            if per_machine_lag1 else float('nan')),
+        'per_machine_lag1_acf': per_machine_lag1,
+        'per_machine_ljung_box_p': per_machine_ljung_box_p,
+        'median_ljung_box_p': (float(np.median(per_machine_ljung_box_p))
+                               if per_machine_ljung_box_p else float('nan')),
+        'fraction_rejecting_at_005': (rejecting / machines_tested
+                                      if machines_tested else float('nan')),
+        'machines_rejecting': rejecting,
+        'machines_tested': machines_tested,
+        'median_autocorrelation': median_acf_by_lag,
+        'excess_kurtosis': float(stats.kurtosis(residuals)),
+        'skewness': float(stats.skew(residuals)),
+        'residual_sd': float(residuals.std()),
+        'residual_mad': float(robust_mad),
+        'sd_to_robust_sd_ratio': float(residuals.std() / (1.4826 * robust_mad))
+        if robust_mad > 0 else float('nan'),
+        'per_machine_residual_sd_min': float(np.min(per_machine_std)),
+        'per_machine_residual_sd_max': float(np.max(per_machine_std)),
+        'per_machine_residual_sd_median': float(np.median(per_machine_std)),
+        'per_machine_count': len(per_machine_std),
+        'pooled_residual_sd_percentage_points': float(residuals.std() * target_std),
+    }
 
 
 def posterior_geometry(design, noise_variance):
@@ -764,9 +838,10 @@ def run_sampler_repeatedly(sampler_function, design, target, label, extra_argume
             acceptance_rates.append(output['acceptance_rate'])
             gradient_total += output.get('gradient_evaluations', 0)
         elapsed = time.time() - started
+        mean_acceptance = (None if any(a is None for a in acceptance_rates)
+                           else float(np.mean(acceptance_rates)))
         summary = summarise_sampler(coefficient_chains, variance_chains, elapsed,
-                                    float(np.mean(acceptance_rates)), gradient_total,
-                                    POSTERIOR_DRAWS)
+                                    mean_acceptance, gradient_total, POSTERIOR_DRAWS)
         summaries.append(summary)
         if repeat_index == 0:
             pooled_coefficients, pooled_variances = coefficient_chains, variance_chains
@@ -790,7 +865,7 @@ def hamiltonian_sensitivity_study(design, target, warm_start):
     """
     results = []
     for step_size in (0.001, 0.002, 0.004, 0.008):
-        for leapfrog_steps in (5, 10, 20):
+        for leapfrog_steps in (5, 10, 15, 20):
             chains, variance_chains, acceptances = [], [], []
             gradient_total = 0
             started = time.time()
@@ -809,19 +884,28 @@ def hamiltonian_sensitivity_study(design, target, warm_start):
             elapsed = time.time() - started
             bulk = min(bulk_effective_sample_size([chain[:, index] for chain in chains])
                        for _, index in REPORTED_PARAMETERS)
-            worst = max(max(maximum_rhat([chain[:, index] for chain in chains])
-                            for _, index in REPORTED_PARAMETERS),
-                        maximum_rhat(variance_chains))
-            converged = bool(worst < RHAT_THRESHOLD)
+            coefficient_rhats = [maximum_rhat([chain[:, index] for chain in chains])
+                                 for _, index in REPORTED_PARAMETERS]
+            variance_rhat = maximum_rhat(variance_chains)
+            all_rhats = coefficient_rhats + [variance_rhat]
+            if any(r is None for r in all_rhats):
+                worst = None
+                converged = False
+            else:
+                worst = max(all_rhats)
+                converged = bool(worst < RHAT_THRESHOLD)
             results.append({'step_size': step_size, 'leapfrog_steps': leapfrog_steps,
                             'acceptance': float(np.mean(acceptances)), 'bulk_ess': float(bulk),
-                            'worst_rhat': float(worst), 'converged': converged,
+                            'worst_rhat': worst, 'converged': converged,
                             'gradient_evaluations': int(gradient_total),
                             'bulk_ess_per_gradient': float(bulk / gradient_total),
                             'bulk_ess_per_second': float(bulk / elapsed), 'time': elapsed})
-            print('    eps=%.3f L=%2d -> acc %.3f | R-hat %.4f | bulk ESS %7.1f | ESS/grad %.2e%s'
-                  % (step_size, leapfrog_steps, results[-1]['acceptance'], worst, bulk,
-                     results[-1]['bulk_ess_per_gradient'], '' if converged else '  [NOT conv]'))
+            rhat_str = 'degenerate' if worst is None else '%.4f' % worst
+            print('    eps=%.3f L=%2d -> acc %.3f | R-hat %s | bulk ESS %7.1f'
+                  ' | ESS/grad %.2e%s'
+                  % (step_size, leapfrog_steps, results[-1]['acceptance'], rhat_str,
+                     bulk, results[-1]['bulk_ess_per_gradient'],
+                     '' if converged else '  [NOT conv]'))
     return results
 
 
@@ -835,13 +919,14 @@ def metropolis_sensitivity_study(design, target):
 
 
 def initialisation_study(design, target, least_squares_coefficients):
-    """Iterations needed to reach the stationary level of the log posterior, from four starts.
+    """Iterations needed to reach a stable region of the log-posterior, from four starts.
 
-    The stationary level is the median log posterior over the final 500 iterations of a
-    1,500-iteration run. A chain is deemed to have reached it at the first iteration after which
-    the log posterior stays within 1 percent of that level for 50 consecutive iterations.
-    Requiring persistence rather than a single crossing stops a chain being credited for merely
-    passing through the region on its way elsewhere.
+    The stable region is defined by the median and median absolute deviation (MAD) of the
+    log-posterior over the final 500 iterations. A chain is deemed to have reached it at the
+    first iteration after which the log-posterior stays inside median +/- 3*MAD for the
+    remainder of the run. This is a dispersion-based rule; it does not prove stationarity,
+    only that the chain stopped drifting on a scale commensurate with its eventual
+    fluctuations.
     """
     coefficient_count = design.shape[1]
     starts = {
@@ -850,9 +935,8 @@ def initialisation_study(design, target, least_squares_coefficients):
         'dispersed (all +3)': np.concatenate([np.full(coefficient_count, 3.0), [np.log(5.0)]]),
         'extreme variance': np.concatenate([np.zeros(coefficient_count), [np.log(100.0)]]),
     }
-    samplers = {'Preconditioned MH': preconditioned_metropolis_hastings, 'Gibbs': gibbs_sampler,
-                'HMC': hamiltonian_monte_carlo}
-    persistence = 50
+    samplers = {'Preconditioned MH': preconditioned_metropolis_hastings,
+                'Gibbs': gibbs_sampler, 'HMC': hamiltonian_monte_carlo}
     results = {}
     for sampler_name, sampler_function in samplers.items():
         results[sampler_name] = {}
@@ -860,17 +944,23 @@ def initialisation_study(design, target, least_squares_coefficients):
             output = sampler_function(design, target, 1000, 500, random_seed=7,
                                       initial_parameters=start_vector)
             trace = output['log_posterior']
-            level = float(np.median(trace[-500:]))
-            within = np.abs(trace - level) < 0.01 * abs(level)
-            reached, run_length = -1, 0
-            for position, flag in enumerate(within):
-                run_length = run_length + 1 if flag else 0
-                if run_length >= persistence:
-                    reached = position - persistence + 1
-                    break
-            results[sampler_name][start_name] = {'iterations_to_stationarity': int(reached),
-                                                 'log_posterior_trace': trace[:400].tolist(),
-                                                 'stationary_level': level}
+            tail = trace[-500:]
+            level = float(np.median(tail))
+            mad = float(np.median(np.abs(tail - level)))
+            if mad < 1e-15:
+                mad = 1e-15
+            within = np.abs(trace - level) < 3.0 * mad
+            outside_indices = np.where(~within)[0]
+            if len(outside_indices) == 0:
+                reached = 0
+            elif outside_indices[-1] >= len(trace) - 1:
+                reached = -1
+            else:
+                reached = int(outside_indices[-1] + 1)
+            results[sampler_name][start_name] = {
+                'iterations_to_stable_region': reached,
+                'log_posterior_trace': trace[:400].tolist(),
+                'stationary_level': level}
     return results
 
 
@@ -881,7 +971,8 @@ def select_likelihood_on_validation(train, validation, target_std):
                              random_seed=3)
     gaussian_metrics = posterior_predictive_evaluation(
         gaussian['coefficients'], gaussian['variances'], validation['design'],
-        validation['target'], target_std, random_seed=11)
+        validation['target'], target_std, machine_labels=validation['machine'],
+        random_seed=11)
     candidates.append({'likelihood': 'Gaussian', 'degrees_of_freedom': None,
                        'validation_log_density': gaussian_metrics['mean_log_predictive_density'],
                        'validation_coverage_50': gaussian_metrics['coverage_50'],
@@ -895,8 +986,8 @@ def select_likelihood_on_validation(train, validation, target_std):
                                         BURN_IN_DRAWS, degrees_of_freedom, random_seed=3)
         metrics = posterior_predictive_evaluation(
             fitted['coefficients'], fitted['variances'], validation['design'],
-            validation['target'], target_std, random_seed=11,
-            degrees_of_freedom=degrees_of_freedom)
+            validation['target'], target_std, machine_labels=validation['machine'],
+            random_seed=11, degrees_of_freedom=degrees_of_freedom)
         candidates.append({'likelihood': 'Student-t', 'degrees_of_freedom': degrees_of_freedom,
                            'validation_log_density': metrics['mean_log_predictive_density'],
                            'validation_coverage_50': metrics['coverage_50'],
@@ -1013,7 +1104,8 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
 
     figure, axes = plt.subplots(2, 2, figsize=(15, 9))
     figure.suptitle('Posterior distributions by sampler', fontsize=15, fontweight='bold')
-    panels = [('Intercept', 0), ('beta_1', 1), ('beta_3', 3), ('sigma2', None)]
+    panels = [('Intercept', 0), ('Mem_Usage_KB_lag1', 1),
+              ('Disk_Write_KBps_lag1', 3), ('sigma2', None)]
     for axis, (label, index) in zip(axes.flat, panels):
         for name in method_names:
             if index is None:
@@ -1029,19 +1121,16 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     save_figure('fig_posteriors.png')
 
     figure, axes = plt.subplots(1, 2, figsize=(15, 5))
-    figure.suptitle('Residual diagnostics for the pooled linear model', fontsize=15,
-                    fontweight='bold')
-    autocorrelation = np.array(residuals_test['autocorrelation'])
-    axes[0].bar(range(1, len(autocorrelation)), autocorrelation[1:], color='steelblue')
-    confidence_band = 1.96 / np.sqrt(len(predictions['test_target']))
-    axes[0].axhline(confidence_band, color='red', linestyle='--', linewidth=1,
-                    label='95% band under independence')
-    axes[0].axhline(-confidence_band, color='red', linestyle='--', linewidth=1)
-    axes[0].set_title('Residual autocorrelation (test)\nLjung-Box p = %.3g'
-                      % residuals_test['ljung_box_p_value'])
+    figure.suptitle('Per-machine residual diagnostics', fontsize=15, fontweight='bold')
+    median_acf = np.array(residuals_test['median_autocorrelation'])
+    if len(median_acf) > 1:
+        axes[0].bar(range(1, len(median_acf)), median_acf[1:], color='steelblue')
+    axes[0].axhline(0, color='black', linewidth=0.5)
+    axes[0].set_title(
+        'Median per-machine residual ACF (test)\n%d/%d machines reject Ljung-Box at 5%%'
+        % (residuals_test['machines_rejecting'], residuals_test['machines_tested']))
     axes[0].set_xlabel('Lag')
-    axes[0].set_ylabel('ACF')
-    axes[0].legend(fontsize=9)
+    axes[0].set_ylabel('ACF (median across machines)')
     test_residuals = predictions['test_target'] - predictions['gaussian_point_predictions']
     stats.probplot(test_residuals, dist='norm', plot=axes[1])
     axes[1].get_lines()[0].set_markersize(2)
@@ -1104,7 +1193,7 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     axes[0].set_xticks(positions)
     axes[0].set_xticklabels(levels)
     axes[0].set_ylabel('Empirical coverage')
-    axes[0].set_title('Coverage with block-bootstrap 95% intervals')
+    axes[0].set_title('Coverage with cluster-bootstrap 95% intervals')
     axes[0].legend(fontsize=9)
     axes[1].bar(positions - 0.2, [predictions['gaussian']['width_50_percentage_points'],
                                   predictions['gaussian']['width_95_percentage_points']],
@@ -1204,9 +1293,10 @@ def main():
     print('\nResidual diagnostics on the test split...')
     residuals_test = residual_diagnostics(test['design'], test['target'], test['machine'],
                                           dataset['target_std'])
-    print('  lag-1 ACF %.3f | Ljung-Box p %.3g | excess kurtosis %.1f'
-          % (residuals_test['lag1_autocorrelation'], residuals_test['ljung_box_p_value'],
-             residuals_test['excess_kurtosis']))
+    print('  median per-machine lag-1 ACF %.3f | %d/%d machines reject Ljung-Box at 5%%'
+          ' | excess kurtosis %.1f'
+          % (residuals_test['median_lag1_acf'], residuals_test['machines_rejecting'],
+             residuals_test['machines_tested'], residuals_test['excess_kurtosis']))
     pooling_analysis = residual_diagnostics(train['design'], train['target'], train['machine'],
                                             dataset['target_std'])
     print('  per-VM residual sd on train ranges %.3f to %.3f (median %.3f) across %d machines'
@@ -1230,9 +1320,12 @@ def main():
             function, train['design'], train['target'], name)
         summaries[name] = summary
         chain_storage[name] = {'coefficients': coefficient_chains, 'variances': variance_chains}
-        print('  acceptance %.3f | R-hat %.4f | bulk ESS %.1f | tail ESS %.1f | %.1f s | %s'
-              % (summary['acceptance_rate'], summary['worst_rhat'], summary['min_bulk_ess'],
-                 summary['min_tail_ess'], summary['time'],
+        acc = summary['acceptance_rate']
+        rhat = summary['worst_rhat']
+        print('  acceptance %s | R-hat %s | bulk ESS %.1f | tail ESS %.1f | %.1f s | %s'
+              % ('N/A' if acc is None else '%.3f' % acc,
+                 'N/A' if rhat is None else '%.4f' % rhat,
+                 summary['min_bulk_ess'], summary['min_tail_ess'], summary['time'],
                  'converged' if summary['converged'] else 'NOT converged'))
     print('\nLonger run for Preconditioned MH (%s draws per chain)...'
           % '{:,}'.format(LONG_RUN_DRAWS))
@@ -1291,7 +1384,7 @@ def main():
                                  BURN_IN_DRAWS, random_seed=3)
     gaussian_test = posterior_predictive_evaluation(
         gaussian_fit['coefficients'], gaussian_fit['variances'], test['design'], test['target'],
-        dataset['target_std'], random_seed=21)
+        dataset['target_std'], machine_labels=test['machine'], random_seed=21)
     robust_coefficient_chains, robust_variance_chains = [], []
     robust_started = time.time()
     for chain_index in range(CHAIN_COUNT):
@@ -1301,7 +1394,7 @@ def main():
         robust_coefficient_chains.append(chain['coefficients'])
         robust_variance_chains.append(chain['variances'])
     student_t_diagnostics = summarise_sampler(robust_coefficient_chains, robust_variance_chains,
-                                              time.time() - robust_started, 1.0, 0,
+                                              time.time() - robust_started, None, 0,
                                               POSTERIOR_DRAWS)
     student_t_diagnostics['degrees_of_freedom'] = selected_degrees
     print('  Student-t diagnostics: worst R-hat %.4f | min bulk ESS %.0f | converged %s'
@@ -1309,7 +1402,8 @@ def main():
              student_t_diagnostics['converged']))
     robust_test = posterior_predictive_evaluation(
         np.vstack(robust_coefficient_chains), np.concatenate(robust_variance_chains),
-        test['design'], test['target'], dataset['target_std'], random_seed=21,
+        test['design'], test['target'], dataset['target_std'],
+        machine_labels=test['machine'], random_seed=21,
         degrees_of_freedom=selected_degrees)
     print('  Gaussian : RMSE %.4f (%.3f pp) | median abs err %.4f (%.3f pp) | 50%% cov %.3f'
           % (gaussian_test['rmse'], gaussian_test['rmse_percentage_points'],
@@ -1341,8 +1435,14 @@ def main():
     initialisation = initialisation_study(train['design'], train['target'], least_squares)
     for sampler_name, entries in initialisation.items():
         for start_name, entry in entries.items():
-            print('  %-18s from %-20s -> %d iterations'
-                  % (sampler_name, start_name, entry['iterations_to_stationarity']))
+            count = entry['iterations_to_stable_region']
+            if count < 0:
+                print('  %-18s from %-20s -> did not reach stable region'
+                      % (sampler_name, start_name))
+            else:
+                unit = 'iteration' if count == 1 else 'iterations'
+                print('  %-18s from %-20s -> %d %s'
+                      % (sampler_name, start_name, count, unit))
     predictive_draws = np.quantile(
         (gaussian_fit['coefficients'][:2000] @ test['design'].T
          + np.sqrt(gaussian_fit['variances'][:2000])[:, None]
@@ -1401,8 +1501,8 @@ def main():
         'hmc_sensitivity': hmc_grid,
         'mh_sensitivity': metropolis_grid,
         'initialisation_sensitivity': {
-            sampler: {start: {'iterations_to_stationarity':
-                              entry['iterations_to_stationarity'],
+            sampler: {start: {'iterations_to_stable_region':
+                              entry['iterations_to_stable_region'],
                               'stationary_level': entry['stationary_level']}
                       for start, entry in entries.items()}
             for sampler, entries in initialisation.items()},

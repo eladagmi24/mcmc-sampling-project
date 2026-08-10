@@ -163,6 +163,52 @@ any sampler. Gibbs reproduces it to within 1.4×10⁻⁴.
 - README numbers regenerated from the current results file; the "fixes the calibration" phrasing
   softened to match the report, which is careful that the intervals remain miscalibrated.
 
+## Reviewer feedback round (August 2026)
+
+### Code changes (run_experiment_v2.py, mcmc_diagnostics.py)
+
+- **All 12 parameters monitored.** `REPORTED_PARAMETERS` expanded from 4 (indices 1, 3, 6, 10) to
+  all 11 regression coefficients plus sigma^2. This exposed a coordinate (Disk_Read_KBps_lag1,
+  R-hat 1.0109) that pushed Preconditioned MH above the 1.01 threshold at the standard 10,000
+  draws — the convergence flag **flipped from True to False**. The long run (40,000 draws) remains
+  converged at R-hat 1.0033.
+- **L=15 added to HMC sensitivity grid**, making it 4×4 = 16 cells. Only 1 of 16 converged
+  (ε=0.002, L=15) — down from 2 of 12 before, because monitoring all 12 parameters is stricter.
+- **Degenerate-chain R-hat returns None** instead of astronomically large numbers
+  (`DEGENERATE_VARIANCE_THRESHOLD = 1e-10` in `mcmc_diagnostics.py`).
+- **Stationarity rule replaced.** The "within 1% of stationary level for 50 consecutive iterations"
+  criterion was replaced with a dispersion-based rule: median ± 3·MAD of the final 500 iterations,
+  sustained for the remainder of the chain. Key renamed `iterations_to_stable_region`.
+- **Panel-aware residual diagnostics.** ACF and Ljung-Box are now computed per machine, never across
+  machine boundaries. Reported values: median per-machine lag-1 ACF, per-machine Ljung-Box
+  rejection count and fraction, adaptive lag count (`min(max_lag, n//3)` per machine).
+- **Cluster bootstrap** replaces block bootstrap for coverage intervals: resamples machines with
+  replacement, keeping each machine's observations intact.
+- **Gibbs acceptance rate → None** instead of 1.0 (structural property, not a tuning diagnostic).
+- **Inverse-Gamma terminology fixed.** Docstring now reads: "1/σ² ~ Gamma(a0, rate=b0),
+  equivalently σ² ~ Inverse-Gamma(a0, scale=b0)."
+
+### Report text changes (create_report_v2.py)
+
+- §2.7 "Aggregation across parameters" now says all 12 parameters, not 4.
+- §2.1 Inverse-Gamma formula shows both Gamma (shape-rate) and Inverse-Gamma (shape-scale) forms.
+- §5.2 Convergence narrative updated: "Two samplers meet the criterion at the standard run length
+  and three do not." Preconditioned MH described as not converged at 10k, converging at 40k.
+- §5.4 Efficiency table handles None acceptance (Gibbs → N/A). Ranking paragraph no longer claims
+  HMC is the most efficient per draw; Gibbs leads both per second and per draw.
+- §5.7 Stationarity rule description updated to MAD-based. Key `iterations_to_stable_region`.
+  Initialisation narrative revised to match new data.
+- §6.4 Residual paragraph uses panel-aware keys (median per-machine ACF, Ljung-Box rejection count).
+- §6.5 Calibration table caption: "cluster-bootstrap" replaces "moving-block bootstrap".
+- §6.5 Coverage interpretation: "about 1.5 times wider" replaced with "covering roughly X times the
+  intended fraction of observations" to avoid conflating coverage ratio with width ratio.
+- §7 RQ1: "Two of the five" instead of "Three of the five". RQ2: Gibbs most efficient per draw,
+  not HMC.
+- §8 Conclusions updated to reflect the Preconditioned MH flip.
+- HMC grid table handles None R-hat (displays "degenerate").
+- Abstract updated: "Gibbs and HMC converge; preconditioned Metropolis converges only with a
+  longer run."
+
 ## Open items
 
 1. **Title page** — course and lecturer are filled in. Institution and student ID numbers remain

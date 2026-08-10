@@ -17,6 +17,7 @@ import numpy as np
 from scipy import stats
 
 MINIMUM_VARIANCE = 1e-300
+DEGENERATE_VARIANCE_THRESHOLD = 1e-10
 
 
 def split_chains(chains):
@@ -69,7 +70,15 @@ def folded_rank_normalized_rhat(chains):
 
 
 def maximum_rhat(chains):
-    """The reported R-hat: the larger of the rank-normalised and folded rank-normalised values."""
+    """The reported R-hat: the larger of the rank-normalised and folded rank-normalised values.
+
+    Returns None when chains are degenerate (near-constant within each chain). Convergence
+    diagnostics are undefined for a constant chain; None is the correct representation,
+    not an astronomically large number.
+    """
+    split = split_chains(chains)
+    if split.var(axis=1, ddof=1).mean() < DEGENERATE_VARIANCE_THRESHOLD:
+        return None
     return float(max(rank_normalized_rhat(chains), folded_rank_normalized_rhat(chains)))
 
 

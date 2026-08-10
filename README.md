@@ -20,11 +20,11 @@ library used inside any of them:
 
 | Sampler | Idea | Result on this posterior |
 |---|---|---|
-| Metropolis-Hastings | isotropic random walk | **did not converge**, R-hat 4.40 |
+| Metropolis-Hastings | isotropic random walk | **did not converge**, R-hat 4.53 |
 | Adaptive MH | proposal covariance learned from the chain | **did not converge**, 1.1% acceptance |
-| Preconditioned MH | proposal shaped by the observed Fisher information | converged, bulk ESS 627 |
-| Gibbs | exact full conditionals | converged, best ESS per second |
-| HMC | gradient-informed, leapfrog integrator | converged, bulk ESS 15,905 |
+| Preconditioned MH | proposal shaped by the observed Fisher information | **not converged at 10k draws** (R-hat 1.0109); converged at 40k |
+| Gibbs | exact full conditionals | converged, best ESS per second and per draw |
+| HMC | gradient-informed, leapfrog integrator | converged, bulk ESS 3,670 |
 | Student-t Gibbs | robust likelihood as a normal scale mixture | improves the calibration substantially |
 
 ## Main findings
@@ -34,12 +34,13 @@ and matches the shipped report. The earlier round of experiments, and the correc
 here, are preserved in [`docs/PROJECT_STATUS_AND_FINDINGS.md`](docs/PROJECT_STATUS_AND_FINDINGS.md)
 and [`docs/archive/`](docs/archive/).
 
-**Two of the five samplers never converged.** With 4 overdispersed chains and
-rank-normalised, folded R-hat, plain Metropolis-Hastings reaches R-hat 4.40 and adaptive
-Metropolis 3.35, against a threshold of 1.01. Their posterior means are wrong by
-1.36 and 1.44 against a deterministic quadrature reference — larger than the standard
-deviation of the widest direction of the posterior (0.050), so the errors exceed the entire
-posterior spread.
+**Three of the five samplers did not converge at the standard 10,000 draws per chain.** With
+4 overdispersed chains, all 12 parameters monitored, and rank-normalised folded R-hat, plain
+Metropolis-Hastings reaches R-hat 4.53 and adaptive Metropolis 3.48, against a threshold of 1.01.
+Preconditioned MH sits at R-hat 1.0109, just above the threshold — exposed by monitoring all
+parameters rather than a subset. A longer run (40,000 draws) converges at R-hat 1.0033. The
+non-converging samplers' posterior means are wrong by up to 1.44 against a deterministic
+quadrature reference — larger than the posterior's entire spread.
 
 **The cause is geometric, not generic.** The posterior covariance has condition number
 314 and a maximum coefficient correlation of 0.69, because the lagged CPU features
@@ -51,7 +52,7 @@ instructive.** Learning the proposal covariance from the chain's own history can
 chain barely moves during the 2,000 burn-in iterations available: it measures the transient
 drift toward the mode rather than the posterior, and acceptance collapses to 1.1%. Supplying the
 metric externally, from the observed Fisher information, raises bulk ESS from 4.2 to
-627 and brings acceptance to 24.6% against the theoretical optimum of 23.4%.
+600 and brings acceptance to 24.6% against the theoretical optimum of 23.4%.
 
 **The over-wide predictive intervals are caused by the data, not the priors.** The test residuals
 have an excess kurtosis of 111. A plain OLS fit, with no priors and no MCMC, reproduces the
@@ -61,8 +62,8 @@ absolute error from 0.210 to 0.072 CPU percentage points. That is a substantial
 improvement rather than a fix: at 74.1% against a nominal 50% the intervals remain clearly
 miscalibrated, and the report says so.
 
-**Validation.** Gibbs, HMC and preconditioned MH agree with a deterministic quadrature reference,
-which involves no sampling at all, to within 0.0025. The same posterior sampled with
+**Validation.** Gibbs and HMC agree with a deterministic quadrature reference,
+which involves no sampling at all, to within 0.0010. The same posterior sampled with
 [emcee](https://emcee.readthedocs.io), a third-party library using an unrelated ensemble
 algorithm, agrees to within 0.00112. The Student-t model is diagnosed on the same footing:
 4 chains, R-hat 1.0012, minimum bulk ESS 2272.

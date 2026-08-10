@@ -365,7 +365,8 @@ abstract_text = (
     'boundaries and all scaling estimated on training data alone. Convergence is assessed with '
     'rank-normalised and folded R-hat and with bulk and tail effective sample size (ESS), '
     'computed jointly across %d dispersed chains %s. '
-    'Gibbs, Hamiltonian Monte Carlo and preconditioned Metropolis converge. Plain random-walk '
+    'Gibbs and Hamiltonian Monte Carlo converge; preconditioned Metropolis converges only with a '
+    'longer run. Plain random-walk '
     'Metropolis and adaptive Metropolis do not, reaching R-hat %.2f and %.2f, with posterior '
     'means wrong by %.2f and %.2f against a deterministic quadrature reference. The cause is '
     'posterior anisotropy, condition number %.0f. Preconditioning with the observed Fisher '
@@ -444,10 +445,12 @@ add_paragraph('The regression model for the standardised target is')
 add_formula('y | X, beta, sigma^2  ~  N(X beta, sigma^2 I_n)')
 add_paragraph('The two priors are specified independently of one another:')
 add_formula('beta ~ N(0, tau^2 I_p),   tau^2 = %.0f' % 10.0)
-add_formula('sigma^2 ~ Inverse-Gamma(a0 = %.0f, b0 = %.0f)  in shape-rate form'
-            % (2.0, 1.0))
+add_formula('1/sigma^2 ~ Gamma(a0 = %.0f, rate = b0 = %.0f),  equivalently  '
+            'sigma^2 ~ Inverse-Gamma(a0 = %.0f, scale = b0 = %.0f)'
+            % (2.0, 1.0, 2.0, 1.0))
 add_paragraph(
-    'The Inverse-Gamma is parameterised by shape a0 and rate b0, with density proportional to '
+    'The precision 1/sigma^2 follows a Gamma in shape-rate form; inverting gives sigma^2 an '
+    'Inverse-Gamma in shape-scale form, with density proportional to '
     '(sigma^2)^(-a0-1) exp(-b0 / sigma^2). The Gamma distributions appearing in the Student-t '
     'sampler of Section 2.6 are likewise in shape-rate form. This matters in implementation '
     'because NumPy draws Gamma variates with a scale argument, so every rate is passed as its '
@@ -558,12 +561,13 @@ add_paragraph(
     % cite('geyer1992'))
 add_paragraph('Aggregation across parameters.', bold=True)
 add_paragraph(
-    'Each diagnostic is computed for one parameter at a time, for the intercept, two further '
-    'coefficients and sigma^2. The single number reported for a sampler is the worst case: the '
-    'maximum R-hat and the minimum bulk and tail ESS over those parameters. Taking the worst '
-    'rather than an average prevents one badly behaved coordinate from being hidden by well '
-    'behaved ones. Efficiency per second uses the same minimum bulk ESS and the same total '
-    'runtime, so the ratio is internally consistent.')
+    'Each diagnostic is computed for one parameter at a time, for all %d regression coefficients '
+    'and the noise variance sigma^2, %d parameters in total. The single number reported for a '
+    'sampler is the worst case: the maximum R-hat and the minimum bulk and tail ESS over those '
+    'parameters. Taking the worst rather than an average prevents one badly behaved coordinate '
+    'from being hidden by well behaved ones. Efficiency per second uses the same minimum bulk '
+    'ESS and the same total runtime, so the ratio is internally consistent.'
+    % (data_summary['n_features'], data_summary['n_features'] + 1))
 add_paragraph('Monte Carlo standard error.', bold=True)
 add_paragraph(
     'MCSE is the posterior standard deviation divided by the square root of the joint bulk ESS, '
@@ -769,19 +773,22 @@ add_table('Convergence diagnostics from %d dispersed chains of %s draws. R-hat i
           ['Sampler', 'R-hat', 'Bulk ESS', 'Tail ESS', 'Converged'], convergence_rows,
           column_widths_cm=[4.6, 2.4, 2.6, 2.6, 2.6])
 add_paragraph(
-    'Three samplers meet the criterion and two do not. Plain Metropolis reaches R-hat %.2f and '
-    'adaptive Metropolis %.2f, both far above the threshold, with bulk ESS in single figures out '
-    'of %s draws. Neither has converged, and no quantity derived from them, whether a posterior '
-    'mean, an efficiency figure or a predictive score, can be interpreted as an estimate of the '
-    'target.'
+    'Two samplers meet the criterion at the standard run length and three do not. Plain '
+    'Metropolis reaches R-hat %.2f and adaptive Metropolis %.2f, both far above the threshold, '
+    'with bulk ESS in single figures out of %s draws. Neither has converged, and no quantity '
+    'derived from them, whether a posterior mean, an efficiency figure or a predictive score, '
+    'can be interpreted as an estimate of the target.'
     % (samplers['MH']['worst_rhat'], samplers['Adaptive MH (naive)']['worst_rhat'],
        thousands(samplers['MH']['total_draws'])))
 add_paragraph(
-    'Preconditioned Metropolis sits at R-hat %.4f with the shorter runs, which is close enough to '
-    'the %.2f threshold to be called borderline rather than settled. Extending it to %s draws per '
-    'chain gives R-hat %.4f and bulk ESS %.0f, which is comfortably converged. Both figures are '
-    'reported so the borderline case is visible rather than concealed by rounding.'
-    % (samplers['Preconditioned MH']['worst_rhat'], configuration['rhat_threshold'],
+    'Preconditioned Metropolis does not converge at %s draws per chain, with R-hat %.4f '
+    'exceeding the %.2f threshold. Monitoring all %d parameters exposed a coordinate that was '
+    'not visible in a smaller diagnostic set. Extending to %s draws per chain gives R-hat %.4f '
+    'and bulk ESS %.0f, which does converge, confirming that the standard run length was '
+    'insufficient rather than the method itself failing.'
+    % (thousands(configuration['draws_per_chain']),
+       samplers['Preconditioned MH']['worst_rhat'], configuration['rhat_threshold'],
+       data_summary['n_features'] + 1,
        thousands(configuration['long_run_draws']), long_run['worst_rhat'],
        long_run['min_bulk_ess']))
 add_figure('fig_convergence.png',
@@ -859,7 +866,8 @@ efficiency_rows = []
 for name in CONVERGED_SAMPLERS:
     entry = samplers[name]
     efficiency_rows.append((
-        name, format_percentage(entry['acceptance_rate']),
+        name, format_percentage(entry['acceptance_rate']) if entry['acceptance_rate'] is not None
+        else 'N/A',
         '%.0f' % entry['min_bulk_ess'],
         '%.1f +/- %.1f' % (entry['time_mean'], entry['time_sd']),
         '%.0f' % entry['bulk_ess_per_second'],
@@ -880,10 +888,10 @@ add_paragraph(
     'predictive comparison in Section 6.')
 ranking = sorted(CONVERGED_SAMPLERS, key=lambda name: -samplers[name]['bulk_ess_per_second'])
 add_paragraph(
-    'The ranking by bulk ESS per second is %s. Gibbs leads because each draw is exact and cheap; '
-    'HMC produces nearly uncorrelated draws but pays for %d gradient evaluations per iteration; '
-    'preconditioned Metropolis is cheapest per iteration but still random-walks. The Monte Carlo '
-    'standard errors tell the same story in the units that matter for reporting a posterior mean.'
+    'The ranking by bulk ESS per second is %s. Gibbs leads because each draw is exact and cheap '
+    'and because its ESS per draw is close to one; HMC produces nearly uncorrelated draws but '
+    'pays for %d gradient evaluations per iteration. The Monte Carlo standard errors tell the '
+    'same story in the units that matter for reporting a posterior mean.'
     % (', '.join('%s (%.0f)' % (name, samplers[name]['bulk_ess_per_second'])
                  for name in ranking), 15))
 
@@ -955,8 +963,9 @@ add_paragraph(
     'not as certifying any of them as converged.')
 grid_rows = []
 for cell in hmc_grid:
+    rhat_display = '%.4f' % cell['worst_rhat'] if cell['worst_rhat'] is not None else 'degenerate'
     grid_rows.append(('%.3f' % cell['step_size'], str(cell['leapfrog_steps']),
-                      format_percentage(cell['acceptance']), '%.3f' % cell['worst_rhat'],
+                      format_percentage(cell['acceptance']), rhat_display,
                       '%.0f' % cell['bulk_ess'], '%.2e' % cell['bulk_ess_per_gradient'],
                       'yes' if cell['converged'] else 'no'))
 add_table('HMC sensitivity to step size and trajectory length. Cells that did not converge are '
@@ -1003,34 +1012,32 @@ add_heading('5.7 Sensitivity to the Starting Point', level=2)
 add_paragraph(
     'MCMC converges from any starting point in theory but says nothing about how long that takes. '
     'Each sampler was started from four deliberately different points. A chain is deemed to have '
-    'reached stationarity at the first iteration after which its log posterior remains within one '
-    'percent of the stationary level, defined as the median log posterior over the final 500 '
-    'iterations, for 50 consecutive iterations. Requiring persistence rather than a single '
-    'crossing prevents a chain from being credited for merely passing through the region on its '
-    'way elsewhere.')
+    'reached a stable region at the first iteration after which its log posterior remains within '
+    'three median absolute deviations (MAD) of the median over the final 500 iterations for the '
+    'remainder of the chain. Requiring sustained containment rather than a brief crossing '
+    'prevents a chain from being credited for merely passing through the region on its way '
+    'elsewhere.')
 start_names = list(next(iter(initialisation.values())).keys())
-add_table('Iterations required to reach the stationary level of the log posterior.',
+add_table('Iterations required to reach the stable region of the log posterior.',
           ['Sampler'] + [name.replace(' (all +3)', ' (+3)') for name in start_names],
-          [tuple([sampler] + [str(entries[start]['iterations_to_stationarity'])
+          [tuple([sampler] + [str(entries[start]['iterations_to_stable_region'])
                               for start in start_names])
            for sampler, entries in initialisation.items()],
           column_widths_cm=[4.4, 2.6, 3.4, 3.0, 3.0])
-gibbs_worst = max(initialisation['Gibbs'][s]['iterations_to_stationarity'] for s in start_names)
+gibbs_worst = max(initialisation['Gibbs'][s]['iterations_to_stable_region']
+                  for s in start_names)
+hmc_worst = max(initialisation['HMC'][s]['iterations_to_stable_region']
+                for s in start_names)
+pm_values = [initialisation['Preconditioned MH'][s]['iterations_to_stable_region']
+             for s in start_names]
 add_paragraph(
-    'Gibbs is effectively insensitive to the starting point, reaching stationarity within %d '
-    'iterations from every start, because its first draw of beta comes from the exact conditional '
-    'given sigma^2 and therefore lands in the posterior bulk immediately. The samplers that move '
-    'by local proposals take substantially longer. For both of them the dispersed start, with all '
-    'coefficients set to +3, is the hardest case, not the extreme-variance start: preconditioned '
-    'Metropolis needs %d iterations from the dispersed start against %d from the extreme-variance '
-    'start, and HMC %d against %d. A start that is far away in the coefficients has to be '
-    'traversed by many small moves, whereas an inflated sigma^2 is corrected quickly because it '
-    'enters the log posterior directly.'
-    % (gibbs_worst,
-       initialisation['Preconditioned MH']['dispersed (all +3)']['iterations_to_stationarity'],
-       initialisation['Preconditioned MH']['extreme variance']['iterations_to_stationarity'],
-       initialisation['HMC']['dispersed (all +3)']['iterations_to_stationarity'],
-       initialisation['HMC']['extreme variance']['iterations_to_stationarity']))
+    'Gibbs and HMC both reach the stable region at a similar iteration count from every start, '
+    '%d and %d respectively, because their rapid mixing makes the starting point irrelevant: '
+    'the occasional late excursion from the MAD band is driven by random variation rather than '
+    'by the initial transient. Preconditioned Metropolis varies more, taking between %d and %d '
+    'iterations depending on the start, because its slower mixing means the initial transient '
+    'still influences how long the chain needs to settle.'
+    % (gibbs_worst, hmc_worst, min(pm_values), max(pm_values)))
 add_figure('fig_initialisation.png',
            'Log posterior over the first iterations from four starting points, on a symmetric '
            'logarithmic scale. Curves that meet quickly indicate the starting point has been '
@@ -1157,16 +1164,16 @@ add_paragraph(
     'parameter with which to describe both regimes and inflates sigma^2 to cover the spikes.'
     % (residuals['excess_kurtosis'], residuals['sd_to_robust_sd_ratio']))
 add_paragraph(
-    'They also remain autocorrelated. The lag-one residual autocorrelation is %.3f and a '
-    'Ljung-Box test over %d lags gives a statistic of %.1f with p = %.3g, so the hypothesis of '
-    'independent residuals is %s. The model treats observations as conditionally independent '
-    'given the predictors, and the lag terms absorb much but not all of the serial structure. '
-    'Remaining autocorrelation means the effective number of independent test observations is '
-    'smaller than the nominal count, which is why the coverage estimates below are accompanied by '
-    'block-bootstrap intervals rather than binomial ones.'
-    % (residuals['lag1_autocorrelation'], residuals['ljung_box_lags'],
-       residuals['ljung_box_statistic'], residuals['ljung_box_p_value'],
-       'rejected' if residuals['ljung_box_p_value'] < 0.05 else 'not rejected'))
+    'They also remain autocorrelated within each machine. The median per-machine lag-one '
+    'residual autocorrelation is %.3f and %d of %d machines reject the Ljung-Box test at the '
+    '5 percent level (median p = %.3f). The model treats observations as conditionally '
+    'independent given the predictors, and the lag terms absorb much but not all of the serial '
+    'structure within each machine. Remaining autocorrelation means the effective number of '
+    'independent test observations is smaller than the nominal count, which is why the coverage '
+    'estimates below are accompanied by cluster-bootstrap intervals that resample machines with '
+    'replacement rather than binomial ones.'
+    % (residuals['median_lag1_acf'], residuals['machines_rejecting'],
+       residuals['machines_tested'], residuals['median_ljung_box_p']))
 add_figure('fig_residuals.png',
            'Left: residual autocorrelation on the test split with the band expected under '
            'independence. Right: normal Q-Q plot of the test residuals, whose S-shape is the '
@@ -1185,11 +1192,10 @@ for level in (50, 95):
         format_interval(STUDENT_TEST['coverage_%d_interval' % level]),
         '%.2f' % GAUSSIAN_TEST['width_%d_percentage_points' % level],
         '%.2f' % STUDENT_TEST['width_%d_percentage_points' % level]))
-add_table('Posterior predictive interval coverage on the test split, with moving-block bootstrap '
-          '95 percent intervals (block length %d, %s replicates) that account for residual serial '
-          'dependence. Widths are in CPU percentage points.'
-          % (configuration['bootstrap_block_length'],
-             thousands(configuration['bootstrap_replicates'])),
+add_table('Posterior predictive interval coverage on the test split, with cluster-bootstrap '
+          '95 percent intervals (%s replicates, resampling machines with replacement) that '
+          'account for within-machine serial dependence. Widths are in CPU percentage points.'
+          % thousands(configuration['bootstrap_replicates']),
           ['Nominal', 'Gaussian', 'Gaussian 95% CI', 'Student-t', 'Student-t 95% CI',
            'Width Gauss (pp)', 'Width t (pp)'], calibration_rows,
           column_widths_cm=[1.8, 2.0, 3.0, 2.0, 3.0, 2.4, 2.2])
@@ -1202,12 +1208,12 @@ add_paragraph(
 add_paragraph(
     'The Student-t likelihood improves calibration substantially but does not fix it. Coverage of '
     'the nominal 50 percent interval falls from %s to %s and the mean width from %.2f to %.2f '
-    'percentage points, yet %s against a nominal 50 percent is still severely miscalibrated: the '
-    'intervals remain about %.1f times wider than they should be. This is a partial improvement, '
-    'not a repair, and the residual miscalibration is consistent with the diagnostics of Section '
-    '6.4: a Student-t with a single scale still assumes one noise level for every machine and '
-    'every time, whereas the data are heteroscedastic across machines, as Section 3.5 showed, and '
-    'serially dependent.'
+    'percentage points, yet %s against a nominal 50 percent is still severely miscalibrated, '
+    'covering roughly %.1f times the intended fraction of observations. This is a partial '
+    'improvement, not a repair, and the residual miscalibration is consistent with the '
+    'diagnostics of Section 6.4: a Student-t with a single scale still assumes one noise level '
+    'for every machine and every time, whereas the data are heteroscedastic across machines, as '
+    'Section 3.5 showed, and serially dependent.'
     % (format_percentage(GAUSSIAN_TEST['coverage_50']),
        format_percentage(STUDENT_TEST['coverage_50']),
        GAUSSIAN_TEST['width_50_percentage_points'], STUDENT_TEST['width_50_percentage_points'],
@@ -1218,7 +1224,7 @@ add_paragraph(
     'least-squares fit and its residual standard deviation, with no Bayesian machinery at all.')
 add_figure('fig_calibration.png',
            'Left: coverage of posterior predictive intervals under each likelihood, with '
-           'block-bootstrap intervals and stars marking the nominal levels. Right: mean interval '
+           'cluster-bootstrap intervals and stars marking the nominal levels. Right: mean interval '
            'width in CPU percentage points.',
            'Two bar charts comparing Gaussian and Student-t likelihoods, showing coverage well '
            'above nominal for both and much narrower intervals under the Student-t.')
@@ -1235,17 +1241,20 @@ add_figure('fig_predictions.png',
 add_heading('7. Discussion', level=1)
 add_paragraph('Answers to the research questions.', bold=True)
 add_paragraph(
-    'RQ1. Three of the five samplers converge. The two that fail do so because the posterior is '
-    'anisotropic, with condition number %.0f arising from the near-collinear lag features, and '
-    'because an isotropic random-walk proposal cannot cope with that geometry. Supplying a metric '
-    'from the observed Fisher information repairs it; estimating the metric from the chain itself '
-    'does not, under the burn-in budget tested.' % geometry['condition_number'])
+    'RQ1. Two of the five samplers converge at the standard %s draws per chain. Preconditioned '
+    'Metropolis converges only with a longer run of %s draws. The two that fail entirely do so '
+    'because the posterior is anisotropic, with condition number %.0f arising from the '
+    'near-collinear lag features, and because an isotropic random-walk proposal cannot cope with '
+    'that geometry. Supplying a metric from the observed Fisher information largely repairs it; '
+    'estimating the metric from the chain itself does not, under the burn-in budget tested.'
+    % (thousands(configuration['draws_per_chain']),
+       thousands(configuration['long_run_draws']), geometry['condition_number']))
 add_paragraph(
-    'RQ2. Among converged samplers, Gibbs is the most efficient per second in this conjugate '
-    'setting, and HMC is the most efficient per draw. The gradient-based method pays for L '
-    'gradient evaluations per iteration, and the sensitivity grid shows its efficiency per '
-    'gradient depends jointly on step size and trajectory length, with the best configuration not '
-    'the one with the highest acceptance rate.')
+    'RQ2. Among the samplers that converge at the standard run length, Gibbs is the most '
+    'efficient both per second and per draw in this conjugate setting. HMC produces nearly '
+    'uncorrelated draws but pays for L gradient evaluations per iteration, and the sensitivity '
+    'grid shows its efficiency per gradient depends jointly on step size and trajectory length, '
+    'with the best configuration not the one with the highest acceptance rate.')
 add_paragraph(
     'RQ3. The intervals are not calibrated. A Gaussian likelihood produces nominal 50 percent '
     'intervals covering %s, because heavy-tailed residuals inflate the single noise parameter. A '
@@ -1261,8 +1270,9 @@ add_bullet('Adaptive Metropolis: sound in principle and standard in practice, bu
            'bootstrap a proposal covariance from a chain that mixes too slowly during the burn-in '
            'available. A longer adaptation phase would be the obvious remedy.')
 add_bullet('Preconditioned Metropolis: keeps the generality of Metropolis while removing the '
-           'anisotropy penalty, at negligible extra cost, and needs no conjugacy. It remains a '
-           'random walk and stays an order of magnitude behind the other two.')
+           'anisotropy penalty, at negligible extra cost, and needs no conjugacy. It converges '
+           'only with a longer run and remains a random walk, an order of magnitude behind '
+           'Gibbs and HMC in effective sample size.')
 add_bullet('Gibbs: no tuning, exact conditionals, insensitive to the starting point, and the '
            'fastest here. It requires closed-form conditionals, which exist only because of the '
            'prior structure chosen, so it does not generalise to most realistic models.')
@@ -1287,11 +1297,14 @@ add_bullet('Conclusions come from one dataset, and the ranking of samplers depen
 # --------------------------------------------------------------------------------------------
 
 add_heading('8. Conclusions', level=1)
-add_bullet('On this posterior, Gibbs sampling, Hamiltonian Monte Carlo and Fisher-preconditioned '
-           'Metropolis converge, reproducing a deterministic quadrature reference to within %.4f. '
-           'Random-walk Metropolis and adaptive Metropolis do not converge, reaching R-hat %.2f '
-           'and %.2f.' % (WORST_CONVERGED_DEVIATION, samplers['MH']['worst_rhat'],
-                          samplers['Adaptive MH (naive)']['worst_rhat']))
+add_bullet('On this posterior, Gibbs sampling and Hamiltonian Monte Carlo converge at the '
+           'standard %s draws per chain, reproducing a deterministic quadrature reference to '
+           'within %.4f. Fisher-preconditioned Metropolis converges only with a longer run of '
+           '%s draws. Random-walk Metropolis and adaptive Metropolis do not converge, reaching '
+           'R-hat %.2f and %.2f.'
+           % (thousands(configuration['draws_per_chain']), WORST_CONVERGED_DEVIATION,
+              thousands(configuration['long_run_draws']),
+              samplers['MH']['worst_rhat'], samplers['Adaptive MH (naive)']['worst_rhat']))
 add_bullet('The failure is explained by posterior anisotropy, condition number %.0f, caused by '
            'near-collinear lag features. Preconditioning with the observed Fisher information '
            'raises bulk ESS from %.1f to %.0f at negligible cost.'
