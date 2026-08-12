@@ -22,9 +22,9 @@ library used inside any of them:
 |---|---|---|
 | Metropolis-Hastings | isotropic random walk | **did not converge**, R-hat 4.53 |
 | Adaptive MH | proposal covariance learned from the chain | **did not converge**, 1.1% acceptance |
-| Preconditioned MH | proposal shaped by the observed Fisher information | **not converged at 10k draws** (R-hat 1.0109); converged at 40k |
-| Gibbs | exact full conditionals | converged, best ESS per second and per draw |
-| HMC | gradient-informed, leapfrog integrator | converged, bulk ESS 3,670 |
+| Preconditioned MH | proposal shaped by the observed Fisher information | **not converged at 10k draws** (R-hat 1.0109); converged at 40k, bulk ESS 2,117 |
+| Gibbs | exact full conditionals | converged, best ESS per second and per draw (0.98 ESS per draw) |
+| HMC | gradient-informed, leapfrog integrator | converged, bulk ESS 3,670 (0.09 ESS per draw) |
 | Student-t Gibbs | robust likelihood as a normal scale mixture | improves the calibration substantially |
 
 ## Main findings
@@ -51,8 +51,10 @@ while crossing one of width 0.0499.
 instructive.** Learning the proposal covariance from the chain's own history cannot work when the
 chain barely moves during the 2,000 burn-in iterations available: it measures the transient
 drift toward the mode rather than the posterior, and acceptance collapses to 1.1%. Supplying the
-metric externally, from the observed Fisher information, raises bulk ESS from 4.2 to
-600 and brings acceptance to 24.6% against the theoretical optimum of 23.4%.
+metric externally, from the observed Fisher information, brings acceptance to 24.6% against the
+theoretical optimum of 23.4%. Its bulk ESS at the standard run length is 600 against 4.2, but
+that chain did not converge, so the figure is a diagnostic comparison rather than a reliable
+efficiency result; the converged 40,000-draw run reaches bulk ESS 2,117.
 
 **The over-wide predictive intervals are caused by the data, not the priors.** The test residuals
 have an excess kurtosis of 111. A plain OLS fit, with no priors and no MCMC, reproduces the
@@ -86,6 +88,7 @@ mcmc-sampling-project/
 |---|---|
 | [`src/run_experiment_v2.py`](src/run_experiment_v2.py) | Current experiment script: all five samplers, corrected diagnostics, residual and posterior-geometry analysis, Student-t sampler, initialisation study, emcee reference, all figures |
 | [`src/create_report_v2.py`](src/create_report_v2.py) | Generates `docs/Sampling_Project_Report.docx` from the results JSON |
+| [`src/finalise_document.ps1`](src/finalise_document.ps1) | Drives Word to evaluate the TOC field and export a PDF; optional |
 | [`src/run_experiment.py`](src/run_experiment.py), [`src/create_report.py`](src/create_report.py) | First-round scripts, kept for provenance |
 | [`src/create_proposal.py`](src/create_proposal.py), [`src/create_script.py`](src/create_script.py) | Generate the proposal deck and its presenter script |
 | [`results/experiment_results_v2.json`](results/experiment_results_v2.json) | Numerical results reported in the document |
@@ -101,11 +104,18 @@ mcmc-sampling-project/
 pip install -r requirements.txt
 
 # download the data first (see data/README.md), then, from the repository root:
-python src/run_experiment_v2.py --skip-nuts   # ~18 minutes -> results/ JSON + figures
+python src/run_experiment_v2.py --skip-nuts   # ~20 minutes -> results/ JSON + figures
 python src/create_report_v2.py                # a few seconds -> docs/Sampling_Project_Report.docx
+
+# optional, Windows + Word only: evaluate the TOC field and export a PDF
+powershell -ExecutionPolicy Bypass -File src/finalise_document.ps1
 ```
 
-The experiment took about 18 minutes on the machine used for the current results. Most of that is
+The third step is not required. `python-docx` writes the table-of-contents field but cannot
+evaluate it, so the document sets `w:updateFields` and Word rebuilds the TOC when the file is
+opened. The script simply bakes that in and produces a PDF for inspection.
+
+The experiment took about 20 minutes on the machine used for the current results. Most of that is
 Hamiltonian Monte Carlo, which is run for 4 chains and 3 independent repeats, and the emcee
 reference; the figure varies with machine load.
 

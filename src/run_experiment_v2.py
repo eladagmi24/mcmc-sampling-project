@@ -71,6 +71,10 @@ RHAT_THRESHOLD = 1.01
 BULK_ESS_THRESHOLD = 400.0
 BOOTSTRAP_BLOCK_LENGTH = 50
 BOOTSTRAP_REPLICATES = 2000
+STABLE_REGION_WINDOW = 50
+HMC_GRID_CHAINS = 4
+HMC_GRID_DRAWS = 4000
+HMC_GRID_BURN_IN = 1500
 GAUSSIAN_SAMPLERS = ['MH', 'Adaptive MH (naive)', 'Preconditioned MH', 'Gibbs', 'HMC']
 METHOD_COLORS = {'MH': 'steelblue', 'Adaptive MH (naive)': 'firebrick',
                  'Preconditioned MH': 'darkorange', 'Gibbs': 'coral', 'HMC': 'seagreen'}
@@ -745,6 +749,7 @@ def residual_diagnostics(design, target, machine_labels, target_std, maximum_lag
     per_machine_ljung_box_p = []
     per_machine_std = []
     per_machine_acf = []
+    per_machine_length = []
     for machine in unique_machines:
         mask = machine_labels == machine
         machine_residuals = residuals[mask]
@@ -762,6 +767,7 @@ def residual_diagnostics(design, target, machine_labels, target_std, maximum_lag
         else:
             acf_full = np.zeros_like(acf_full)
         per_machine_lag1.append(float(acf_full[1]))
+        per_machine_length.append(n)
         padded = np.full(maximum_lag + 1, np.nan)
         padded[:min(len(acf_full), maximum_lag + 1)] = acf_full[:maximum_lag + 1]
         per_machine_acf.append(padded)
@@ -787,6 +793,8 @@ def residual_diagnostics(design, target, machine_labels, target_std, maximum_lag
                                       if machines_tested else float('nan')),
         'machines_rejecting': rejecting,
         'machines_tested': machines_tested,
+        'median_machine_length': (int(np.median(per_machine_length))
+                                  if per_machine_length else 0),
         'median_autocorrelation': median_acf_by_lag,
         'excess_kurtosis': float(stats.kurtosis(residuals)),
         'skewness': float(stats.skew(residuals)),
@@ -858,10 +866,11 @@ def run_sampler_repeatedly(sampler_function, design, target, label, extra_argume
 def hamiltonian_sensitivity_study(design, target, warm_start):
     """Vary step size and trajectory length jointly, reporting ESS per gradient evaluation.
 
-    The grid runs are warm started at the least-squares fit and given a long burn-in. A short
-    run from a dispersed start would not have converged for every configuration, and an ESS
-    computed from an unconverged chain measures nothing, so each cell also reports its R-hat and
-    is marked converged or not.
+    The grid runs are warm started at the least-squares fit and given a long burn-in. Because
+    the chains begin close together, split R-hat here cannot certify convergence: chains that
+    start in the same place can agree without having explored the posterior. Each cell therefore
+    reports whether it meets the diagnostic thresholds, which ranks configurations against one
+    another rather than certifying any of them.
     """
     results = []
     for step_size in (0.001, 0.002, 0.004, 0.008):
@@ -869,10 +878,11 @@ def hamiltonian_sensitivity_study(design, target, warm_start):
             chains, variance_chains, acceptances = [], [], []
             gradient_total = 0
             started = time.time()
-            for chain_index in range(4):
+            for chain_index in range(HMC_GRID_CHAINS):
                 perturbed = warm_start + 0.01 * np.random.default_rng(
                     900 + chain_index).normal(size=len(warm_start))
-                output = hamiltonian_monte_carlo(design, target, 4000, 1500,
+                output = hamiltonian_monte_carlo(design, target, HMC_GRID_DRAWS,
+                                                 HMC_GRID_BURN_IN,
                                                  random_seed=77 + chain_index,
                                                  initial_parameters=perturbed,
                                                  step_size=step_size,
@@ -890,13 +900,15 @@ def hamiltonian_sensitivity_study(design, target, warm_start):
             all_rhats = coefficient_rhats + [variance_rhat]
             if any(r is None for r in all_rhats):
                 worst = None
-                converged = False
+                meets_thresholds = False
             else:
                 worst = max(all_rhats)
-                converged = bool(worst < RHAT_THRESHOLD)
+                meets_thresholds = bool(worst < RHAT_THRESHOLD)
             results.append({'step_size': step_size, 'leapfrog_steps': leapfrog_steps,
                             'acceptance': float(np.mean(acceptances)), 'bulk_ess': float(bulk),
-                            'worst_rhat': worst, 'converged': converged,
+                            'worst_rhat': worst, 'meets_thresholds': meets_thresholds,
+                            'chains': HMC_GRID_CHAINS, 'draws_per_chain': HMC_GRID_DRAWS,
+                            'burn_in': HMC_GRID_BURN_IN,
                             'gradient_evaluations': int(gradient_total),
                             'bulk_ess_per_gradient': float(bulk / gradient_total),
                             'bulk_ess_per_second': float(bulk / elapsed), 'time': elapsed})
@@ -905,7 +917,7 @@ def hamiltonian_sensitivity_study(design, target, warm_start):
                   ' | ESS/grad %.2e%s'
                   % (step_size, leapfrog_steps, results[-1]['acceptance'], rhat_str,
                      bulk, results[-1]['bulk_ess_per_gradient'],
-                     '' if converged else '  [NOT conv]'))
+                     '' if meets_thresholds else '  [below thresholds]'))
     return results
 
 
@@ -918,15 +930,31 @@ def metropolis_sensitivity_study(design, target):
     return results
 
 
+def first_sustained_index(indicator, window):
+    """First index from which `indicator` is True for `window` consecutive entries.
+
+    Returns -1 when no such run exists. A cumulative sum gives the count of True entries in
+    every window of the required length in one pass, so the search is O(n) rather than O(n*w).
+    """
+    flags = np.asarray(indicator, dtype=np.int64)
+    if len(flags) < window:
+        return -1
+    cumulative = np.concatenate([[0], np.cumsum(flags)])
+    window_totals = cumulative[window:] - cumulative[:-window]
+    qualifying = np.where(window_totals == window)[0]
+    return int(qualifying[0]) if len(qualifying) else -1
+
+
 def initialisation_study(design, target, least_squares_coefficients):
     """Iterations needed to reach a stable region of the log-posterior, from four starts.
 
     The stable region is defined by the median and median absolute deviation (MAD) of the
-    log-posterior over the final 500 iterations. A chain is deemed to have reached it at the
-    first iteration after which the log-posterior stays inside median +/- 3*MAD for the
-    remainder of the run. This is a dispersion-based rule; it does not prove stationarity,
-    only that the chain stopped drifting on a scale commensurate with its eventual
-    fluctuations.
+    log-posterior over the final 500 iterations. A chain is deemed to have entered it at the
+    first iteration from which the log-posterior stays inside median +/- 3*MAD for 50
+    consecutive iterations. Requiring a sustained window rather than the remainder of the run
+    measures the end of the initial transient rather than the last random excursion from the
+    band. This is a descriptive rule about when the starting point stops mattering; it is not
+    evidence of stationarity.
     """
     coefficient_count = design.shape[1]
     starts = {
@@ -950,17 +978,12 @@ def initialisation_study(design, target, least_squares_coefficients):
             if mad < 1e-15:
                 mad = 1e-15
             within = np.abs(trace - level) < 3.0 * mad
-            outside_indices = np.where(~within)[0]
-            if len(outside_indices) == 0:
-                reached = 0
-            elif outside_indices[-1] >= len(trace) - 1:
-                reached = -1
-            else:
-                reached = int(outside_indices[-1] + 1)
+            reached = first_sustained_index(within, STABLE_REGION_WINDOW)
             results[sampler_name][start_name] = {
                 'iterations_to_stable_region': reached,
-                'log_posterior_trace': trace[:400].tolist(),
-                'stationary_level': level}
+                'log_posterior_trace': np.asarray(trace).tolist(),
+                'stationary_level': level,
+                'band_half_width': 3.0 * mad}
     return results
 
 
@@ -1006,7 +1029,8 @@ def select_likelihood_on_validation(train, validation, target_std):
 # --------------------------------------------------------------------------------------------
 
 def generate_figures(chain_storage, summaries, residuals_test, geometry, initialisation,
-                     likelihood_candidates, hmc_grid, predictions, dataset, raw_frame_sample):
+                     likelihood_candidates, hmc_grid, predictions, dataset, raw_frame_sample,
+                     long_run_summary=None):
     method_names = [name for name in GAUSSIAN_SAMPLERS if name in summaries]
     converged_names = [name for name in method_names if summaries[name]['converged']]
 
@@ -1050,15 +1074,31 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     axes[0].set_title('Posterior correlation of coefficients')
     figure.colorbar(image, ax=axes[0], shrink=0.8)
     pair = [name for name in ['MH', 'Preconditioned MH'] if name in summaries]
-    axes[1].bar(pair, [summaries[name]['min_bulk_ess'] for name in pair],
-                yerr=[summaries[name]['min_bulk_ess_sd'] for name in pair],
-                color=[METHOD_COLORS[name] for name in pair], edgecolor='black', capsize=6)
+    bar_labels = ['%s\n%s draws' % (name, '{:,}'.format(summaries[name]['total_draws']))
+                  for name in pair]
+    bar_values = [summaries[name]['min_bulk_ess'] for name in pair]
+    bar_errors = [summaries[name]['min_bulk_ess_sd'] for name in pair]
+    bar_colors = [METHOD_COLORS[name] for name in pair]
+    bar_converged = [summaries[name]['converged'] for name in pair]
+    if long_run_summary is not None:
+        bar_labels.append('Preconditioned MH\n%s draws'
+                          % '{:,}'.format(long_run_summary['total_draws']))
+        bar_values.append(long_run_summary['min_bulk_ess'])
+        bar_errors.append(0.0)
+        bar_colors.append(METHOD_COLORS['Preconditioned MH'])
+        bar_converged.append(long_run_summary['converged'])
+    bars = axes[1].bar(bar_labels, bar_values, yerr=bar_errors, color=bar_colors,
+                       edgecolor='black', capsize=6)
+    for bar, converged in zip(bars, bar_converged):
+        if not converged:
+            bar.set_hatch('///')
     axes[1].set_yscale('log')
-    axes[1].set_title('Bulk ESS before and after preconditioning')
+    axes[1].set_title('Bulk ESS before and after preconditioning\n'
+                      'hatched = did not meet the convergence criterion')
     axes[1].set_ylabel('Bulk ESS (log scale), error bars over %d repeats' % REPEAT_COUNT)
-    for position, name in enumerate(pair):
-        axes[1].text(position, summaries[name]['min_bulk_ess'],
-                     '%.0f' % summaries[name]['min_bulk_ess'], ha='center', va='bottom')
+    axes[1].tick_params(axis='x', labelsize=8)
+    for position, value in enumerate(bar_values):
+        axes[1].text(position, value, '%.0f' % value, ha='center', va='bottom')
     for name in pair:
         chain = chain_storage[name]['coefficients'][0][:, 0]
         centered = chain - chain.mean()
@@ -1084,7 +1124,7 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     axes[0].set_yscale('log')
     axes[0].set_xticks(positions)
     axes[0].set_xticklabels(method_names, rotation=18, ha='right')
-    axes[0].set_ylabel('Worst R-hat over monitored parameters')
+    axes[0].set_ylabel('Worst R-hat over all %d parameters' % (len(REPORTED_PARAMETERS) + 1))
     axes[0].set_title('Convergence diagnostic')
     axes[0].legend()
     axes[1].bar(positions, [summaries[name]['min_bulk_ess'] for name in method_names],
@@ -1107,13 +1147,28 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     panels = [('Intercept', 0), ('Mem_Usage_KB_lag1', 1),
               ('Disk_Write_KBps_lag1', 3), ('sigma2', None)]
     for axis, (label, index) in zip(axes.flat, panels):
+        panel_values = {}
         for name in method_names:
             if index is None:
-                values = np.concatenate(chain_storage[name]['variances'])
+                panel_values[name] = np.concatenate(chain_storage[name]['variances'])
             else:
-                values = np.vstack(chain_storage[name]['coefficients'])[:, index]
-            axis.hist(values, bins=80, density=True, alpha=0.45, label=name,
+                panel_values[name] = np.vstack(chain_storage[name]['coefficients'])[:, index]
+        # sigma^2 spans orders of magnitude once the failed chains are included, so a linear
+        # axis collapses the converged posterior into an invisible spike. Log bins keep both
+        # the converged peak and the displaced chains readable in the same panel.
+        use_log_axis = index is None and min(v.min() for v in panel_values.values()) > 0
+        if use_log_axis:
+            lowest = min(v.min() for v in panel_values.values())
+            highest = max(v.max() for v in panel_values.values())
+            bins = np.logspace(np.log10(lowest), np.log10(highest), 80)
+        else:
+            bins = 80
+        for name in method_names:
+            axis.hist(panel_values[name], bins=bins, density=True, alpha=0.45, label=name,
                       color=METHOD_COLORS[name])
+        if use_log_axis:
+            axis.set_xscale('log')
+            axis.set_xlabel('sigma^2 (log scale)')
         axis.set_title(label)
         axis.set_ylabel('Density')
         axis.legend(fontsize=8)
@@ -1126,6 +1181,13 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     if len(median_acf) > 1:
         axes[0].bar(range(1, len(median_acf)), median_acf[1:], color='steelblue')
     axes[0].axhline(0, color='black', linewidth=0.5)
+    median_length = residuals_test['median_machine_length']
+    if median_length > 0:
+        band = 1.96 / np.sqrt(median_length)
+        axes[0].axhline(band, color='crimson', linestyle='--', linewidth=1.2,
+                        label='95%% band under independence (n = %d)' % median_length)
+        axes[0].axhline(-band, color='crimson', linestyle='--', linewidth=1.2)
+        axes[0].legend(fontsize=8)
     axes[0].set_title(
         'Median per-machine residual ACF (test)\n%d/%d machines reject Ljung-Box at 5%%'
         % (residuals_test['machines_rejecting'], residuals_test['machines_tested']))
@@ -1244,13 +1306,21 @@ def generate_figures(chain_storage, summaries, residuals_test, geometry, initial
     figure, axes = plt.subplots(1, len(sampler_names), figsize=(6 * len(sampler_names), 5))
     figure.suptitle('Effect of the starting point on convergence', fontsize=15, fontweight='bold')
     for axis, sampler_name in zip(np.atleast_1d(axes), sampler_names):
+        start_colors = {}
         for start_name, entry in initialisation[sampler_name].items():
-            axis.plot(entry['log_posterior_trace'], linewidth=1.5, label=start_name)
+            line = axis.plot(entry['log_posterior_trace'], linewidth=1.2, label=start_name)[0]
+            start_colors[start_name] = line.get_color()
+        for start_name, entry in initialisation[sampler_name].items():
+            entered = entry['iterations_to_stable_region']
+            if entered >= 0:
+                axis.axvline(entered, color=start_colors[start_name], linestyle=':',
+                             linewidth=1.4, alpha=0.9)
         axis.set_title(sampler_name)
         axis.set_xlabel('Iteration')
         axis.set_ylabel('Log posterior')
         axis.set_yscale('symlog')
-        axis.legend(fontsize=8)
+        axis.legend(fontsize=7, loc='lower right', framealpha=0.9,
+                    title='dotted line = entry into stable region', title_fontsize=6)
     plt.tight_layout()
     save_figure('fig_initialisation.png')
 
@@ -1461,7 +1531,8 @@ def main():
         for path in sorted(glob.glob(os.path.join(DATA_DIRECTORY, '*.csv')))[:10]],
         ignore_index=True)
     generate_figures(chain_storage, summaries, residuals_test, geometry, initialisation,
-                     likelihood_candidates, hmc_grid, predictions, dataset, raw_sample)
+                     likelihood_candidates, hmc_grid, predictions, dataset, raw_sample,
+                     long_run_summary=long_summary)
     payload = {
         'configuration': {
             'draws_per_chain': POSTERIOR_DRAWS, 'burn_in': BURN_IN_DRAWS,
@@ -1503,9 +1574,13 @@ def main():
         'initialisation_sensitivity': {
             sampler: {start: {'iterations_to_stable_region':
                               entry['iterations_to_stable_region'],
-                              'stationary_level': entry['stationary_level']}
+                              'stationary_level': entry['stationary_level'],
+                              'band_half_width': entry['band_half_width']}
                       for start, entry in entries.items()}
             for sampler, entries in initialisation.items()},
+        'initialisation_configuration': {
+            'window': STABLE_REGION_WINDOW, 'tail_iterations': 500,
+            'mad_multiplier': 3.0, 'draws': 1000, 'burn_in': 500},
     }
     with open(RESULTS_FILE, 'w') as handle:
         json.dump(payload, handle, indent=2)

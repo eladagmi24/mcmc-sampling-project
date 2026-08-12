@@ -6,9 +6,13 @@ All experiments were rerun from scratch and the report regenerated from
 Reproduce with:
 
 ```
-python src/run_experiment_v2.py --skip-nuts     # ~18 minutes
+python src/run_experiment_v2.py --skip-nuts     # ~20 minutes
 python src/create_report_v2.py
+powershell -ExecutionPolicy Bypass -File src/finalise_document.ps1   # optional; needs Word
 ```
+
+The third step drives Word to evaluate the table-of-contents field and export a PDF. It is
+optional: `w:updateFields` is set in the document, so Word rebuilds the TOC on open anyway.
 
 ---
 
@@ -209,23 +213,114 @@ any sampler. Gibbs reproduces it to within 1.4×10⁻⁴.
 - Abstract updated: "Gibbs and HMC converge; preconditioned Metropolis converges only with a
   longer run."
 
+## Second reviewer round (August 2026)
+
+### 1. Starting-point sensitivity criterion corrected
+
+The previous rule marked the stable region at the first iteration after which the chain stayed
+inside the MAD band **for the whole remainder of the run**. That measures the last random
+excursion out of the band, not the end of the initial transient, which is why it reported ~1,450
+iterations for Gibbs while Figure 6 plainly showed the starting point being forgotten almost
+immediately.
+
+The rule is now: median and MAD over the final 500 iterations, and entry is the first iteration
+from which the log posterior stays within 3 MADs for **50 consecutive iterations**
+(`first_sustained_index`, an O(n) cumulative-sum scan). Table 8 and Figure 6 are now consistent —
+the figure plots the full 1,500-iteration trace with a dotted vertical marker per start showing
+exactly where the tabulated entry occurs. §5.7 states explicitly that this is a descriptive
+measure of when the starting point stops mattering and **not** evidence of stationarity.
+
+### 2. HMC "independent draws" claims removed
+
+Worst-case ESS per retained draw is Gibbs ≈ 0.977 against HMC ≈ 0.092. Every claim that HMC
+produces "nearly uncorrelated" or "near-independent" draws is gone from §5.4, RQ2 and the sampler
+strengths list, replaced by the measured figure. The ratios are computed in the report generator
+(`ESS_PER_DRAW`), not hand-copied.
+
+### 3. Unconverged Preconditioned MH ESS no longer read as efficiency
+
+The standard run has R-hat 1.0109, above the threshold, so its bulk ESS 599 and the "factor of
+142" are no longer presented as efficiency. §5.3 now states that 599 is a nominal diagnostic
+improvement that is **not** interpretable as reliable efficiency, and the defensible comparison
+uses the converged 40,000-draw run (bulk ESS 2,117). Applied consistently in the abstract, §5.3,
+Figure 4 (the unconverged bar is hatched and the long run added as a third bar), the Discussion
+and the Conclusions.
+
+### 4. Warm-start grid wording made self-consistent
+
+The grid cannot certify convergence, so the field is renamed `meets_thresholds` in the results
+JSON and the table column reads **Meets warm-start thresholds**. The text now says "One of the 16
+configurations met the diagnostic thresholds in the warm-start grid" and "the best-performing
+configuration among those meeting the warm-start diagnostic thresholds". Table 6 and its caption
+state the 4 chains, 1,500 burn-in iterations and 4,000 retained draws used per cell.
+
+### 5. Complexity contradiction removed
+
+§3.4 no longer claims every sampler is O(np) per iteration. It now names the per-sampler costs
+consistent with Table 1: O(np) for Metropolis-Hastings, O(np + p³) for Gibbs, O(Lnp) for HMC and
+O(np² + p³) for the Student-t sampler.
+
+### 6. Content corrections
+
+- §2.5 HMC tuning cross-reference corrected from §5.7 to §5.6.
+- Figure 10 caption states it shows the first 250 of the 680 test observations.
+- Coverage is now expressed in percentage points above nominal (44.7 pp for the Gaussian, 24.1 pp
+  for the Student-t) rather than as a ratio of the intended rate.
+- "wider than nominal" replaced by "coverage remains above the nominal level" — nominal refers to
+  coverage, not physical width.
+- Table 4 caption reads "all 12 model parameters" rather than "monitored parameters".
+- Figure 8 now actually draws the ±1.96/√n independence band, using the median per-machine series
+  length, and the caption says so.
+- The HMC acceptance sentence now refers to step-size values instead of the malformed "acceptance
+  rate above 0.004".
+- Stale cross-references (Table 3 → Table 4) are now computed from the table counter, so they
+  cannot drift again.
+
+### 7. Layout
+
+- `w:cantSplit` is applied to **every** table row, not just the header, and is emitted before
+  `w:tblHeader` as the schema requires. A data row breaking across a page was what produced the
+  empty continuation rows above the repeated headers in Tables 6 and 9.
+- `w:updateFields` is set in settings.xml and the document is post-processed through Word so the
+  table of contents and its page numbers are built into the saved file.
+- The `Bulk ESS/gradient` heading is shortened to `ESS/grad.` and the column widths rebalanced.
+- Greek letters, superscripts and operators are rendered as Unicode (β, σ², τ², ν, ε, ρ, θ, ψ, Σ,
+  Φ, R̂, ≥, ±) via `mathematical_symbols`, which matches whole words only and skips any string
+  containing a URL, so prose, identifiers and paths are untouched.
+
+### 8. Verification
+
+The document was rendered to PDF through Word and **all 27 pages were inspected as images**, not
+just parsed. That inspection is what caught the following, which were then fixed at source:
+
+- Table 1 and Tables 6 and 9 split across pages; the repeated header rows are present and there
+  are no empty continuation rows.
+- Figure 3's noise-variance panel was effectively blank: the failed chains reach σ² ≈ 50 while the
+  converged posterior sits at 0.123, so on a linear axis the converged spike was invisible. The
+  panel now uses log-spaced bins and a log axis, showing both.
+- Figure 2's y-axis said "over monitored parameters"; it now says "over all 12 parameters", to
+  match the Table 4 caption.
+- The √ glyph rendered ambiguously in the italic figure caption font, so Figure 8's caption spells
+  out "1.96 divided by the square root of".
+- The abstract reported plain Metropolis bulk ESS as "4" where 4.2 was meant.
+- A comma splice in the final conclusions bullet.
+
+Structural checks reported by `finalise_document.ps1`: 27 pages, 37 populated table-of-contents
+entries, no empty table rows.
+
 ## Open items
 
-1. **Title page** — course and lecturer are filled in. Institution and student ID numbers remain
-   underscore blanks, since I do not know them; fill them in directly or edit
-   `TITLE_PAGE_PLACEHOLDERS` in `src/create_report_v2.py`.
-2. **The TOC is built by Word on open.** The field is marked dirty, so Word rebuilds it with page
-   numbers and links when the document is opened; no user action is needed.
-3. **No visual page-by-page inspection.** The document was verified structurally by parsing its
-   XML (page breaks, fields, header rows, alt text, no stray format specifiers). Rendering to PDF
-   requires Word or LibreOffice, neither of which is available here, so orphaned headers and
-   awkward pagination could not be confirmed visually.
-4. **PyMC/Stan not run.** The independent-specification check is satisfied by the analytical
+1. **Title page** — course and lecturer are filled in. Institution and student ID numbers are
+   marked `[to be completed]`, since the correct values are not known here and were not invented;
+   fill them in directly or edit `TITLE_PAGE_PLACEHOLDERS` in `src/create_report_v2.py`.
+2. **PyMC/Stan not run.** The independent-specification check is satisfied by the analytical
    quadrature reference instead, which is arguably stronger for validating the likelihood and
    priors. PyMC remains unusable here without a C++ compiler.
-5. **ν sits at the edge of the grid** (ν = 2, infinite variance). The report flags this and
+3. **ν sits at the edge of the grid** (ν = 2, infinite variance). The report flags this and
    recommends a prior on ν rather than accepting an edge solution.
-6. **Stale artefacts.** `results/figures/` still contains figures from the previous round that the
+4. **Stale artefacts.** `results/figures/` still contains figures from the previous round that the
    current report does not reference. The flat course folder outside the repository also still
    holds superseded copies of some scripts and the old report. Neither was deleted, since the
    repository reorganisation was not mine to undo.
+5. **emcee is not seeded.** It draws from the global NumPy random state, so its R-hat, ESS and
+   deviation move slightly between runs. Every other number in the report is reproducible exactly.

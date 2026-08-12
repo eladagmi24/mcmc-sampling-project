@@ -5,6 +5,7 @@ report cannot drift out of step with the experiments.
 """
 import json
 import os
+import re
 import sys
 
 from docx import Document
@@ -28,10 +29,10 @@ OUTPUT_FILE = os.path.join(DOCUMENT_DIRECTORY, 'Sampling_Project_Report.docx')
 GITHUB_REPOSITORY_URL = 'https://github.com/eladagmi24/mcmc-sampling-project'
 
 TITLE_PAGE_PLACEHOLDERS = {
-    'Institution': '__________________________',
+    'Institution': '[to be completed]',
     'Course': 'Advanced Methods in Machine Learning',
     'Lecturer': 'Dr. Boaz Tamir',
-    'Student IDs': '__________________________',
+    'Student IDs': '[to be completed]',
 }
 
 with open(RESULTS_FILE, 'r') as handle:
@@ -61,9 +62,20 @@ SELECTED_DEGREES = SELECTED['degrees_of_freedom']
 GAUSSIAN_TEST = test_performance['gaussian']
 STUDENT_TEST = test_performance['student_t']
 OLS_TEST = test_performance['ols']
-CONVERGED_HMC_CELLS = [cell for cell in hmc_grid if cell['converged']]
-BEST_HMC_CELL = max(CONVERGED_HMC_CELLS, key=lambda cell: cell['bulk_ess_per_gradient']) \
-    if CONVERGED_HMC_CELLS else None
+QUALIFYING_HMC_CELLS = [cell for cell in hmc_grid if cell['meets_thresholds']]
+BEST_HMC_CELL = max(QUALIFYING_HMC_CELLS, key=lambda cell: cell['bulk_ess_per_gradient']) \
+    if QUALIFYING_HMC_CELLS else None
+HMC_GRID_SETTINGS = hmc_grid[0]
+INITIALISATION_CONFIGURATION = results['initialisation_configuration']
+
+
+def ess_per_draw(entry):
+    """Worst-case bulk ESS as a fraction of the retained draws it was computed from."""
+    return entry['min_bulk_ess'] / entry['total_draws']
+
+
+ESS_PER_DRAW = {name: ess_per_draw(samplers[name]) for name in GAUSSIAN_SAMPLERS}
+LONG_RUN_ESS_PER_DRAW = ess_per_draw(long_run)
 
 
 # --------------------------------------------------------------------------------------------
@@ -164,7 +176,7 @@ def add_paragraph(text, bold=False, italic=False, size=11, alignment=None, space
         paragraph.alignment = alignment
     paragraph.paragraph_format.space_after = Pt(space_after)
     paragraph.paragraph_format.keep_with_next = keep_with_next
-    run = paragraph.add_run(text)
+    run = paragraph.add_run(mathematical_symbols(text))
     run.font.size = Pt(size)
     run.font.bold = bold
     run.font.italic = italic
@@ -172,7 +184,7 @@ def add_paragraph(text, bold=False, italic=False, size=11, alignment=None, space
 
 
 def add_bullet(text):
-    paragraph = document.add_paragraph(text, style='List Bullet')
+    paragraph = document.add_paragraph(mathematical_symbols(text), style='List Bullet')
     paragraph.paragraph_format.left_indent = Cm(1.27)
     return paragraph
 
@@ -206,19 +218,28 @@ def add_figure(filename, caption, alt_text, width_inches=6.1):
     caption_paragraph = document.add_paragraph()
     caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     caption_paragraph.paragraph_format.space_after = Pt(12)
-    caption_run = caption_paragraph.add_run('Figure %d. %s' % (FIGURE_COUNTER[0], caption))
+    caption_run = caption_paragraph.add_run(
+        mathematical_symbols('Figure %d. %s' % (FIGURE_COUNTER[0], caption)))
     caption_run.font.size = Pt(9.5)
     caption_run.font.italic = True
 
 
 def mark_header_row(table):
-    """Repeat the first row on every page the table spans."""
-    row_properties = table.rows[0]._tr.get_or_add_trPr()
-    header = OxmlElement('w:tblHeader')
-    header.set(qn('w:val'), 'true')
-    row_properties.append(header)
-    cant_split = OxmlElement('w:cantSplit')
-    row_properties.append(cant_split)
+    """Repeat the first row on every page the table spans, and stop rows splitting.
+
+    Every row gets w:cantSplit, not just the header. A data row that is allowed to break across
+    a page boundary leaves its top half stranded, which Word renders as an empty continuation
+    row above the repeated header. Within w:trPr the schema orders w:cantSplit before
+    w:tblHeader, so the elements are appended in that order.
+    """
+    for row_index, row in enumerate(table.rows):
+        row_properties = row._tr.get_or_add_trPr()
+        cant_split = OxmlElement('w:cantSplit')
+        row_properties.append(cant_split)
+        if row_index == 0:
+            header = OxmlElement('w:tblHeader')
+            header.set(qn('w:val'), 'true')
+            row_properties.append(header)
 
 
 def add_table(caption, headers, rows, column_widths_cm=None, no_wrap_first_column=True):
@@ -226,7 +247,8 @@ def add_table(caption, headers, rows, column_widths_cm=None, no_wrap_first_colum
     caption_paragraph = document.add_paragraph()
     caption_paragraph.paragraph_format.space_after = Pt(3)
     caption_paragraph.paragraph_format.keep_with_next = True
-    caption_run = caption_paragraph.add_run('Table %d. %s' % (TABLE_COUNTER[0], caption))
+    caption_run = caption_paragraph.add_run(
+        mathematical_symbols('Table %d. %s' % (TABLE_COUNTER[0], caption)))
     caption_run.font.size = Pt(9.5)
     caption_run.font.italic = True
     table = document.add_table(rows=len(rows) + 1, cols=len(headers))
@@ -235,7 +257,7 @@ def add_table(caption, headers, rows, column_widths_cm=None, no_wrap_first_colum
     table.autofit = False
     for column_index, header_text in enumerate(headers):
         cell = table.rows[0].cells[column_index]
-        cell.text = str(header_text)
+        cell.text = mathematical_symbols(str(header_text))
         for paragraph in cell.paragraphs:
             paragraph.paragraph_format.space_after = Pt(2)
             for run in paragraph.runs:
@@ -244,7 +266,7 @@ def add_table(caption, headers, rows, column_widths_cm=None, no_wrap_first_colum
     for row_index, row_values in enumerate(rows):
         for column_index, value in enumerate(row_values):
             cell = table.rows[row_index + 1].cells[column_index]
-            cell.text = str(value)
+            cell.text = mathematical_symbols(str(value))
             for paragraph in cell.paragraphs:
                 paragraph.paragraph_format.space_after = Pt(2)
                 for run in paragraph.runs:
@@ -258,11 +280,39 @@ def add_table(caption, headers, rows, column_widths_cm=None, no_wrap_first_colum
     return table
 
 
+GREEK_NAMES = {
+    'alpha': 'α', 'beta': 'β', 'epsilon': 'ε', 'mu': 'μ', 'nu': 'ν',
+    'pi': 'π', 'rho': 'ρ', 'sigma': 'σ', 'sigmahat': 'σ̂',
+    'tau': 'τ', 'theta': 'θ', 'psi': 'ψ', 'Phi': 'Φ', 'Sigma': 'Σ',
+}
+SUPERSCRIPTS = {'^2': '²', '^3': '³', '^-1': '⁻¹'}
+MATHEMATICAL_OPERATORS = {'sqrt': '√', '>=': '≥', '<=': '≤', '+/-': '±'}
+GREEK_PATTERN = re.compile(
+    r'(?<![A-Za-z0-9])(%s)(?![A-Za-z0-9])'
+    % '|'.join(sorted(GREEK_NAMES, key=len, reverse=True)))
+
+
+def mathematical_symbols(text):
+    """Render plain-text mathematical names as Unicode symbols.
+
+    Greek names are replaced only as whole words, so ordinary prose is untouched. Text carrying
+    a URL is left alone, since a path segment could otherwise collide with a symbol name.
+    """
+    if 'http' in text:
+        return text
+    converted = GREEK_PATTERN.sub(lambda match: GREEK_NAMES[match.group(1)], text)
+    for plain, symbol in SUPERSCRIPTS.items():
+        converted = converted.replace(plain, symbol)
+    for plain, symbol in MATHEMATICAL_OPERATORS.items():
+        converted = converted.replace(plain, symbol)
+    return converted.replace('R-hat', 'R̂')
+
+
 def add_formula(text):
     paragraph = document.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.space_after = Pt(8)
-    run = paragraph.add_run(text)
+    run = paragraph.add_run(mathematical_symbols(text))
     run.font.name = 'Cambria Math'
     run.font.size = Pt(11.5)
     run.font.italic = True
@@ -279,7 +329,7 @@ def add_code_block(lines):
         run.font.size = Pt(9)
 
 
-def add_field(paragraph, instruction, dirty=False):
+def add_field(paragraph, instruction, dirty=False, placeholder=None):
     begin = OxmlElement('w:fldChar')
     begin.set(qn('w:fldCharType'), 'begin')
     if dirty:
@@ -295,7 +345,26 @@ def add_field(paragraph, instruction, dirty=False):
     run.append(begin)
     run.append(instruction_element)
     run.append(separate)
+    if placeholder:
+        placeholder_text = OxmlElement('w:t')
+        placeholder_text.text = placeholder
+        run.append(placeholder_text)
     run.append(end)
+
+
+def request_field_update_on_open():
+    """Ask Word to recalculate every field when the document is opened.
+
+    The table of contents is a field with no cached result, so without this it renders empty
+    until the reader presses F9. Setting w:updateFields makes Word build it, and the page
+    numbers it depends on, on open.
+    """
+    settings = document.settings.element
+    existing = settings.find(qn('w:updateFields'))
+    if existing is None:
+        existing = OxmlElement('w:updateFields')
+        settings.append(existing)
+    existing.set(qn('w:val'), 'true')
 
 
 def add_page_numbers():
@@ -357,32 +426,31 @@ add_heading('Abstract', level=1)
 abstract_text = (
     'Markov chain Monte Carlo (MCMC) makes Bayesian inference possible when the posterior has no '
     'closed form, but its reliability rests on diagnostics that are easy to misread. This study '
-    'compares five samplers, all implemented from scratch, on Bayesian linear regression for '
+    'compares five samplers, implemented from scratch, on Bayesian linear regression for '
     'forecasting virtual-machine CPU utilisation %d minutes ahead, using the Bitbrains GWA-T-12 '
-    'datacenter traces %s. The samplers are random-walk Metropolis-Hastings, adaptive Metropolis, '
-    'Fisher-preconditioned Metropolis, Gibbs sampling and Hamiltonian Monte Carlo. Observations '
-    'are split chronologically, with an embargo preventing feature windows from crossing split '
-    'boundaries and all scaling estimated on training data alone. Convergence is assessed with '
-    'rank-normalised and folded R-hat and with bulk and tail effective sample size (ESS), '
-    'computed jointly across %d dispersed chains %s. '
+    'datacenter traces %s. The samplers are random-walk, adaptive and Fisher-preconditioned '
+    'Metropolis, Gibbs sampling and Hamiltonian Monte Carlo. Observations are split '
+    'chronologically, with an embargo against feature windows crossing boundaries and scaling '
+    'estimated on training data alone. Convergence is assessed with rank-normalised and folded '
+    'R-hat and with bulk and tail effective sample size (ESS), computed jointly across %d '
+    'dispersed chains over all 12 model parameters %s. '
     'Gibbs and Hamiltonian Monte Carlo converge; preconditioned Metropolis converges only with a '
-    'longer run. Plain random-walk '
-    'Metropolis and adaptive Metropolis do not, reaching R-hat %.2f and %.2f, with posterior '
-    'means wrong by %.2f and %.2f against a deterministic quadrature reference. The cause is '
-    'posterior anisotropy, condition number %.0f. Preconditioning with the observed Fisher '
-    'information raises bulk ESS from %.0f to %.0f, and the converged samplers reproduce the '
-    'quadrature reference to within %.4f. '
+    'longer run. Plain and adaptive Metropolis do not, reaching R-hat %.2f and %.2f, with '
+    'posterior means wrong by %.2f and %.2f against a deterministic quadrature reference. The '
+    'cause is posterior anisotropy, condition number %.0f. Preconditioning repairs the geometry: '
+    'at %s draws it converges at bulk ESS %.0f, against %.1f for plain Metropolis. The converged '
+    'samplers reproduce the quadrature reference to within %.4f. '
     'Test residuals have an excess kurtosis of %.0f, so a Gaussian likelihood yields posterior '
     'predictive intervals that are far too wide, nominal 50%% intervals covering %s. A Student-t '
     'likelihood, with degrees of freedom selected on validation data, reduces this to %s and cuts '
-    'the median absolute error from %.3f to %.3f CPU percentage points, but the intervals remain '
-    'substantially miscalibrated.'
+    'the median absolute error from %.3f to %.3f CPU percentage points, though coverage remains '
+    'well above nominal.'
     % (configuration['horizon_minutes'], cite('shen2015'), configuration['chains'],
        cite('vehtari2021'),
        samplers['MH']['worst_rhat'], samplers['Adaptive MH (naive)']['worst_rhat'],
        DEVIATIONS['MH'], DEVIATIONS['Adaptive MH (naive)'],
-       geometry['condition_number'], samplers['MH']['min_bulk_ess'],
-       samplers['Preconditioned MH']['min_bulk_ess'], WORST_CONVERGED_DEVIATION,
+       geometry['condition_number'], thousands(configuration['long_run_draws']),
+       long_run['min_bulk_ess'], samplers['MH']['min_bulk_ess'], WORST_CONVERGED_DEVIATION,
        residuals['excess_kurtosis'], format_percentage(GAUSSIAN_TEST['coverage_50']),
        format_percentage(STUDENT_TEST['coverage_50']),
        GAUSSIAN_TEST['median_absolute_error_percentage_points'],
@@ -398,7 +466,8 @@ document.add_page_break()
 
 add_heading('Table of Contents', level=1)
 contents_paragraph = document.add_paragraph()
-add_field(contents_paragraph, r' TOC \o "1-3" \h \z \u ', dirty=True)
+add_field(contents_paragraph, r' TOC \o "1-3" \h \z \u ', dirty=True,
+          placeholder='Right-click and choose Update Field if this entry is not populated.')
 
 document.add_page_break()
 
@@ -462,7 +531,7 @@ add_paragraph(
     'while still leaving something for the other samplers to do.')
 
 add_heading('2.2 Metropolis-Hastings', level=2)
-add_paragraph('A proposal theta-prime is accepted with probability')
+add_paragraph("A proposal theta' is accepted with probability")
 add_formula("alpha = min(1, [pi(theta') q(theta | theta')] / [pi(theta) q(theta' | theta)])")
 add_paragraph(
     'For a symmetric random-walk proposal the q terms cancel. The method needs only pointwise '
@@ -495,10 +564,12 @@ add_formula("beta | sigma^2, y  ~  N(Sigma X'y / sigma^2, Sigma),  "
             "Sigma = (X'X / sigma^2 + I / tau^2)^-1")
 add_formula("sigma^2 | beta, y  ~  Inverse-Gamma(a0 + n/2,  b0 + ||y - X beta||^2 / 2)")
 add_paragraph(
-    'Every draw comes from an exact conditional, so nothing is ever rejected. The resulting '
-    'acceptance rate of one is a structural property of the algorithm and carries no information '
-    'about sampling quality, which is why the comparison in Section 5 rests on R-hat, ESS and '
-    'runtime instead.')
+    'Every draw comes from an exact conditional, so nothing is ever rejected. There is no '
+    'accept-reject step to measure, so no acceptance rate is defined for either Gibbs sampler and '
+    'the tables record it as not applicable rather than as one. Quoting one would invite '
+    'comparison with the tuned rates of the Metropolis samplers, where the number reflects how '
+    'well the proposal is matched to the target; here it would reflect only the structure of the '
+    'algorithm. The comparison in Section 5 therefore rests on R-hat, ESS and runtime.')
 
 add_heading('2.5 Hamiltonian Monte Carlo', level=2)
 add_paragraph(
@@ -517,7 +588,7 @@ add_paragraph(
 add_paragraph(
     'The No-U-Turn Sampler, which tunes the trajectory length automatically, was not implemented '
     'or run in this study. Where trajectory length matters it is varied explicitly, in Section '
-    '5.7.')
+    '5.6.')
 
 add_heading('2.6 Student-t Regression as a Normal Scale Mixture', level=2)
 add_paragraph(
@@ -680,7 +751,9 @@ add_paragraph(
     'Of roughly %s raw records available across the selected machines, the study uses the '
     'earliest %s engineered observations. The restriction is computational rather than '
     'statistical. Each sampler is run with %d chains, %s draws per chain and %d independent '
-    'repeats, and the per-iteration cost of every sampler is O(np); the full experiment already '
+    'repeats, and every sampler carries a per-iteration cost that grows linearly in n, from '
+    'O(np) for Metropolis-Hastings through O(np + p^3) for Gibbs and O(Lnp) for HMC to '
+    'O(np^2 + p^3) for the Student-t sampler, as Table 1 sets out; the full experiment already '
     'requires several hundred thousand likelihood or gradient evaluations at n = %s. Using the '
     'whole trace would multiply that by roughly two orders of magnitude without changing what the '
     'experiment is designed to measure, which is the relative behaviour of the samplers on a '
@@ -765,13 +838,15 @@ for name in GAUSSIAN_SAMPLERS:
                              '%.0f' % entry['min_bulk_ess'], '%.0f' % entry['min_tail_ess'],
                              'yes' if entry['converged'] else 'no'))
 add_table('Convergence diagnostics from %d dispersed chains of %s draws. R-hat is the larger of '
-          'the rank-normalised and folded statistics, maximised over monitored parameters; ESS '
+          'the rank-normalised and folded statistics, maximised over all %d model parameters; ESS '
           'values are minima over the same parameters. The criterion is R-hat below %.2f and bulk '
           'ESS at least %.0f.'
           % (configuration['chains'], thousands(configuration['draws_per_chain']),
+             data_summary['n_features'] + 1,
              configuration['rhat_threshold'], configuration['bulk_ess_threshold']),
           ['Sampler', 'R-hat', 'Bulk ESS', 'Tail ESS', 'Converged'], convergence_rows,
           column_widths_cm=[4.6, 2.4, 2.6, 2.6, 2.6])
+CONVERGENCE_TABLE_NUMBER = TABLE_COUNTER[0]
 add_paragraph(
     'Two samplers meet the criterion at the standard run length and three do not. Plain '
     'Metropolis reaches R-hat %.2f and adaptive Metropolis %.2f, both far above the threshold, '
@@ -839,24 +914,33 @@ add_paragraph(
     'to the burn-in budget; a longer adaptation phase, or a better initial proposal, would be '
     'expected to rescue it.' % cite('haario2001'))
 add_paragraph(
-    'Taking the metric from outside the chain does work. Preconditioning with the observed Fisher '
-    'information brings acceptance to %s, against the theoretical optimum of 23.4 percent, and '
-    'raises bulk ESS from %.1f to %.0f, a factor of %.0f, for essentially no additional cost per '
-    'iteration (%.1f seconds against %.1f for the full multi-chain run).'
+    'Taking the metric from outside the chain does work, though the standard run length is not '
+    'sufficient to demonstrate it. Preconditioning with the observed Fisher information brings '
+    'acceptance to %s, against the theoretical optimum of 23.4 percent, for essentially no '
+    'additional cost per iteration (%.1f seconds against %.1f for the full multi-chain run).'
     % (format_percentage(samplers['Preconditioned MH']['acceptance_rate']),
-       samplers['MH']['min_bulk_ess'], samplers['Preconditioned MH']['min_bulk_ess'],
-       samplers['Preconditioned MH']['min_bulk_ess'] / max(samplers['MH']['min_bulk_ess'], 1e-9),
        samplers['Preconditioned MH']['time'], samplers['MH']['time']))
 add_paragraph(
-    'The gain should not be overstated. At %.0f effective draws out of %s, preconditioned '
-    'Metropolis remains an order of magnitude behind Gibbs and HMC. Matching the metric to the '
-    'posterior removes the penalty for anisotropy; it does not remove the random walk.'
-    % (samplers['Preconditioned MH']['min_bulk_ess'],
-       thousands(samplers['Preconditioned MH']['total_draws'])))
+    'The bulk ESS of %.0f recorded for the standard run is a nominal diagnostic improvement over '
+    'the %.1f of plain Metropolis, but it is not interpretable as a reliable efficiency figure: '
+    'the chain did not meet the convergence criterion at that length, and an ESS computed from a '
+    'chain that has not converged measures the rate at which it produces draws from the wrong '
+    'distribution. The defensible comparison uses the extended run, which does converge. At %s '
+    'draws per chain preconditioned Metropolis reaches bulk ESS %.0f, or %.3f per retained draw.'
+    % (samplers['Preconditioned MH']['min_bulk_ess'], samplers['MH']['min_bulk_ess'],
+       thousands(configuration['long_run_draws']), long_run['min_bulk_ess'],
+       LONG_RUN_ESS_PER_DRAW))
+add_paragraph(
+    'Even on those valid numbers the gain should not be overstated. At %.3f effective draws per '
+    'retained draw, preconditioned Metropolis remains well behind Gibbs at %.3f. Matching the '
+    'metric to the posterior removes the penalty for anisotropy; it does not remove the random '
+    'walk.' % (LONG_RUN_ESS_PER_DRAW, ESS_PER_DRAW['Gibbs']))
 add_figure('fig_preconditioning.png',
            'Left: posterior correlation between coefficients, showing the block of correlated lag '
            'and rolling features. Centre: bulk ESS before and after preconditioning, on a '
-           'logarithmic scale. Right: autocorrelation of the intercept.',
+           'logarithmic scale; the preconditioned bar is from the standard run, which did not '
+           'converge, so it is a diagnostic comparison rather than a certified efficiency '
+           'figure. Right: autocorrelation of the intercept.',
            'Three panels: a correlation heat map, a bar chart comparing effective sample size '
            'before and after preconditioning, and autocorrelation curves showing much faster '
            'decay after preconditioning.')
@@ -883,17 +967,20 @@ add_paragraph(
     'Only the converged samplers are ranked. Including Metropolis or adaptive Metropolis in an '
     'efficiency table would invite a false comparison, because an ESS per second computed from a '
     'chain that is sampling the wrong distribution measures the rate at which it produces '
-    'unusable draws. Their diagnostics appear in Table 3 and their runtimes in the accompanying '
+    'unusable draws. Their diagnostics appear in Table %d and their runtimes in the accompanying '
     'results file, but they are excluded from every ranking in this section and from the '
-    'predictive comparison in Section 6.')
+    'predictive comparison in Section 6.' % CONVERGENCE_TABLE_NUMBER)
 ranking = sorted(CONVERGED_SAMPLERS, key=lambda name: -samplers[name]['bulk_ess_per_second'])
 add_paragraph(
-    'The ranking by bulk ESS per second is %s. Gibbs leads because each draw is exact and cheap '
-    'and because its ESS per draw is close to one; HMC produces nearly uncorrelated draws but '
-    'pays for %d gradient evaluations per iteration. The Monte Carlo standard errors tell the '
-    'same story in the units that matter for reporting a posterior mean.'
+    'The ranking by bulk ESS per second is %s. Gibbs leads on both axes. Its worst-case bulk ESS '
+    'is %.3f per retained draw, so even the coordinate that mixes worst is close to independent. '
+    'HMC converges under the selected configuration, but its worst-case ESS is %.3f per retained '
+    'draw, substantially below Gibbs in this conjugate model, and it additionally pays for %d '
+    'gradient evaluations per iteration. The Monte Carlo standard errors tell the same story in '
+    'the units that matter for reporting a posterior mean.'
     % (', '.join('%s (%.0f)' % (name, samplers[name]['bulk_ess_per_second'])
-                 for name in ranking), 15))
+                 for name in ranking),
+       ESS_PER_DRAW['Gibbs'], ESS_PER_DRAW['HMC'], 15))
 
 add_heading('5.5 Validation Against Independent References', level=2)
 add_paragraph(
@@ -958,40 +1045,58 @@ add_paragraph(
     'of their length travelling to the posterior, so the resulting diagnostics would measure '
     'burn-in rather than the effect of the tuning parameters, which is what the grid is meant to '
     'isolate. The cost of that choice is that split R-hat is a weaker guarantee here than in '
-    'Table 4, because chains that begin close together can agree without having explored the '
+    'Table %d, because chains that begin close together can agree without having explored the '
     'posterior. The grid should therefore be read as ranking configurations against one another, '
-    'not as certifying any of them as converged.')
+    'not as certifying any of them as converged. Each cell runs %d chains with %s burn-in '
+    'iterations and %s retained draws per chain.'
+    % (CONVERGENCE_TABLE_NUMBER, HMC_GRID_SETTINGS['chains'],
+       thousands(HMC_GRID_SETTINGS['burn_in']),
+       thousands(HMC_GRID_SETTINGS['draws_per_chain'])))
 grid_rows = []
 for cell in hmc_grid:
     rhat_display = '%.4f' % cell['worst_rhat'] if cell['worst_rhat'] is not None else 'degenerate'
     grid_rows.append(('%.3f' % cell['step_size'], str(cell['leapfrog_steps']),
                       format_percentage(cell['acceptance']), rhat_display,
                       '%.0f' % cell['bulk_ess'], '%.2e' % cell['bulk_ess_per_gradient'],
-                      'yes' if cell['converged'] else 'no'))
-add_table('HMC sensitivity to step size and trajectory length. Cells that did not converge are '
-          'marked; their ESS values are not interpretable and are shown only for completeness.',
-          ['epsilon', 'L', 'Acceptance', 'R-hat', 'Bulk ESS', 'Bulk ESS/gradient', 'Converged'],
-          grid_rows, column_widths_cm=[2.0, 1.4, 2.4, 2.2, 2.2, 3.2, 2.2])
+                      'yes' if cell['meets_thresholds'] else 'no'))
+add_table('HMC sensitivity to step size and trajectory length, from %d warm-started chains with '
+          '%s burn-in iterations and %s retained draws each. The final column records whether a '
+          'cell meets the diagnostic thresholds of Section 2.7; because the chains are warm '
+          'started, meeting them ranks a configuration rather than certifying convergence. ESS '
+          'values for cells below the thresholds are not interpretable and are shown only for '
+          'completeness.'
+          % (HMC_GRID_SETTINGS['chains'], thousands(HMC_GRID_SETTINGS['burn_in']),
+             thousands(HMC_GRID_SETTINGS['draws_per_chain'])),
+          ['epsilon', 'L', 'Acceptance', 'R-hat', 'Bulk ESS', 'ESS/grad.',
+           'Meets warm-start thresholds'],
+          grid_rows, column_widths_cm=[1.8, 1.2, 2.2, 2.2, 2.0, 2.4, 3.6])
 if BEST_HMC_CELL:
     add_paragraph(
-        'Only %d of the %d configurations converged, and the comparison is restricted to those. '
-        'Among them the most efficient is epsilon = %.3f with L = %d, at %.2e bulk ESS per '
-        'gradient evaluation and an acceptance rate of %s.'
-        % (len(CONVERGED_HMC_CELLS), len(hmc_grid), BEST_HMC_CELL['step_size'],
+        'One of the %d configurations met the diagnostic thresholds in the warm-start grid, and '
+        'the comparison is restricted to it. The best-performing configuration among those '
+        'meeting the warm-start diagnostic thresholds is epsilon = %.3f with L = %d, at %.2e '
+        'bulk ESS per gradient evaluation and an acceptance rate of %s.'
+        % (len(hmc_grid), BEST_HMC_CELL['step_size'],
            BEST_HMC_CELL['leapfrog_steps'], BEST_HMC_CELL['bulk_ess_per_gradient'],
            format_percentage(BEST_HMC_CELL['acceptance'])))
     highest_acceptance = max(hmc_grid, key=lambda cell: cell['acceptance'])
+    MAIN_STEP_SIZE = 0.002
+    small_step_cells = [cell for cell in hmc_grid if cell['step_size'] <= MAIN_STEP_SIZE]
+    smallest_small_step_acceptance = min(cell['acceptance'] for cell in small_step_cells)
     add_paragraph(
         'This directly contradicts the reading of a high acceptance rate as a sign of good '
         'tuning. The highest acceptance in the grid, %s at epsilon = %.3f and L = %d, is not the '
         'most efficient configuration; a step size that small buys near-certain acceptance by '
         'proposing moves so short that the trajectory barely advances, and the gradient budget is '
         'spent for little gain. The theoretically motivated target for HMC is roughly 65 to 80 '
-        'percent %s, and every acceptance rate in this grid above %.3f exceeds it, indicating '
-        'that the step size used elsewhere in the study is conservative. At the other extreme, '
-        'epsilon = 0.008 breaks the leapfrog integrator entirely and acceptance falls to zero.'
+        'percent %s. Every configuration with a step size of epsilon = %.3f or smaller, which '
+        'includes the epsilon = %.3f used elsewhere in the study, has an acceptance rate of at '
+        'least %s, far above that target, indicating that the step size used elsewhere is '
+        'conservative. At the other extreme, epsilon = 0.008 breaks the leapfrog integrator '
+        'entirely and acceptance falls to zero.'
         % (format_percentage(highest_acceptance['acceptance']), highest_acceptance['step_size'],
-           highest_acceptance['leapfrog_steps'], cite('beskos2013'), 0.004))
+           highest_acceptance['leapfrog_steps'], cite('beskos2013'), MAIN_STEP_SIZE,
+           MAIN_STEP_SIZE, format_percentage(smallest_small_step_acceptance)))
 add_table('Metropolis acceptance against proposal scale, at fixed scale 0.05 for log sigma^2.',
           ['Proposal scale for beta', 'Acceptance rate'],
           [('%.4f' % entry['step'], format_percentage(entry['acceptance']))
@@ -1011,39 +1116,64 @@ add_figure('fig_hmc_sensitivity.png',
 add_heading('5.7 Sensitivity to the Starting Point', level=2)
 add_paragraph(
     'MCMC converges from any starting point in theory but says nothing about how long that takes. '
-    'Each sampler was started from four deliberately different points. A chain is deemed to have '
-    'reached a stable region at the first iteration after which its log posterior remains within '
-    'three median absolute deviations (MAD) of the median over the final 500 iterations for the '
-    'remainder of the chain. Requiring sustained containment rather than a brief crossing '
-    'prevents a chain from being credited for merely passing through the region on its way '
-    'elsewhere.')
+    'Each sampler was started from four deliberately different points and run for %s iterations. '
+    'The median and median absolute deviation (MAD) of the log posterior are taken over the '
+    'final %d iterations. A chain is recorded as having entered the stable region at the first '
+    'iteration from which its log posterior stays within %.0f MADs of that median for %d '
+    'consecutive iterations. The sustained window is what makes this measure the end of the '
+    'initial transient: a rule that instead demanded containment for the whole remainder of the '
+    'run would report the last random excursion out of the band, which happens late in a chain '
+    'that is already mixing well and has nothing to do with the starting point.'
+    % (thousands(INITIALISATION_CONFIGURATION['draws']
+                 + INITIALISATION_CONFIGURATION['burn_in']),
+       INITIALISATION_CONFIGURATION['tail_iterations'],
+       INITIALISATION_CONFIGURATION['mad_multiplier'],
+       INITIALISATION_CONFIGURATION['window']))
+add_paragraph(
+    'This is a descriptive measure of when the starting point stops mattering. It is not evidence '
+    'of stationarity, and it is not used anywhere in this report as a convergence criterion; that '
+    'role belongs to the R-hat and ESS diagnostics of Section 5.2.')
 start_names = list(next(iter(initialisation.values())).keys())
-add_table('Iterations required to reach the stable region of the log posterior.',
+add_table('Iterations after which the log posterior stays within %.0f MADs of its final-%d-'
+          'iteration median for %d consecutive iterations, by sampler and starting point.'
+          % (INITIALISATION_CONFIGURATION['mad_multiplier'],
+             INITIALISATION_CONFIGURATION['tail_iterations'],
+             INITIALISATION_CONFIGURATION['window']),
           ['Sampler'] + [name.replace(' (all +3)', ' (+3)') for name in start_names],
           [tuple([sampler] + [str(entries[start]['iterations_to_stable_region'])
                               for start in start_names])
            for sampler, entries in initialisation.items()],
           column_widths_cm=[4.4, 2.6, 3.4, 3.0, 3.0])
-gibbs_worst = max(initialisation['Gibbs'][s]['iterations_to_stable_region']
-                  for s in start_names)
-hmc_worst = max(initialisation['HMC'][s]['iterations_to_stable_region']
-                for s in start_names)
-pm_values = [initialisation['Preconditioned MH'][s]['iterations_to_stable_region']
-             for s in start_names]
+INITIALISATION_TABLE_NUMBER = TABLE_COUNTER[0]
+INITIALISATION_FIGURE_NUMBER = FIGURE_COUNTER[0] + 1
+STABLE_REGION_BY_SAMPLER = {
+    sampler: [entries[start]['iterations_to_stable_region'] for start in start_names]
+    for sampler, entries in initialisation.items()}
+WORST_CASE_ENTRY = sorted(((max(values), sampler)
+                           for sampler, values in STABLE_REGION_BY_SAMPLER.items()))
 add_paragraph(
-    'Gibbs and HMC both reach the stable region at a similar iteration count from every start, '
-    '%d and %d respectively, because their rapid mixing makes the starting point irrelevant: '
-    'the occasional late excursion from the MAD band is driven by random variation rather than '
-    'by the initial transient. Preconditioned Metropolis varies more, taking between %d and %d '
-    'iterations depending on the start, because its slower mixing means the initial transient '
-    'still influences how long the chain needs to settle.'
-    % (gibbs_worst, hmc_worst, min(pm_values), max(pm_values)))
+    'Ranked by the slowest of the four starts, the order is %s. Gibbs is insensitive to where it '
+    'starts because its first draw of beta comes from the exact conditional given sigma^2 and '
+    'therefore lands in the posterior bulk immediately, so there is almost no transient to '
+    'measure. The ordering otherwise follows how far each sampler moves per iteration: an exact '
+    'conditional draw crosses the posterior in one step, a Hamiltonian trajectory in a few, and a '
+    'preconditioned random walk in many. These counts are consistent with Figure %d, where the '
+    'traces from different starts become visually indistinguishable at roughly the iterations '
+    'marked by the dotted lines.'
+    % (', '.join('%s at %d iterations' % (sampler, worst)
+                 for worst, sampler in WORST_CASE_ENTRY),
+       INITIALISATION_FIGURE_NUMBER))
 add_figure('fig_initialisation.png',
-           'Log posterior over the first iterations from four starting points, on a symmetric '
-           'logarithmic scale. Curves that meet quickly indicate the starting point has been '
-           'forgotten.',
+           'Log posterior over the full %s iterations from four starting points, on a symmetric '
+           'logarithmic scale. The dotted vertical line in each colour marks where that start '
+           'enters the stable region, as tabulated in Table %d. Curves that meet quickly indicate '
+           'the starting point has been forgotten.'
+           % (thousands(INITIALISATION_CONFIGURATION['draws']
+                        + INITIALISATION_CONFIGURATION['burn_in']),
+              INITIALISATION_TABLE_NUMBER),
            'Three line-chart panels, one per sampler, showing log posterior traces from four '
-           'different starting points converging to a common level at different speeds.')
+           'different starting points converging to a common level at different speeds, with '
+           'dotted vertical lines marking entry into the stable region.')
 
 
 # --------------------------------------------------------------------------------------------
@@ -1175,11 +1305,14 @@ add_paragraph(
     % (residuals['median_lag1_acf'], residuals['machines_rejecting'],
        residuals['machines_tested'], residuals['median_ljung_box_p']))
 add_figure('fig_residuals.png',
-           'Left: residual autocorrelation on the test split with the band expected under '
-           'independence. Right: normal Q-Q plot of the test residuals, whose S-shape is the '
-           'signature of heavy tails.',
-           'Two panels: a bar chart of residual autocorrelation by lag against a confidence band, '
-           'and a normal quantile-quantile plot curving away from the diagonal at both ends.')
+           'Left: median per-machine residual autocorrelation on the test split. The dashed '
+           'lines mark the 95 percent band expected under independence, 1.96 divided by the '
+           'square root of the median per-machine series length of %d observations. Right: '
+           'normal Q-Q plot of the test residuals, whose S-shape is the signature of heavy tails.'
+           % residuals['median_machine_length'],
+           'Two panels: a bar chart of median per-machine residual autocorrelation by lag with '
+           'dashed lines marking the band expected under independence, and a normal '
+           'quantile-quantile plot curving away from the diagonal at both ends.')
 
 add_heading('6.5 Calibration', level=2)
 calibration_rows = []
@@ -1201,15 +1334,17 @@ add_table('Posterior predictive interval coverage on the test split, with cluste
           column_widths_cm=[1.8, 2.0, 3.0, 2.0, 3.0, 2.4, 2.2])
 add_paragraph(
     'Under the Gaussian likelihood the intervals are far too wide. A nominal 50 percent interval '
-    'covers %s of test observations, roughly %.1f times the intended rate, and the nominal 95 '
-    'percent interval covers %s. The bootstrap intervals show this is not sampling noise.'
+    'covers %s of test observations. Coverage is %.1f percentage points above the nominal 50 '
+    'percent level, and the nominal 95 percent interval covers %s. The bootstrap intervals show '
+    'this is not sampling noise.'
     % (format_percentage(GAUSSIAN_TEST['coverage_50']),
-       GAUSSIAN_TEST['coverage_50'] / 0.5, format_percentage(GAUSSIAN_TEST['coverage_95'])))
+       (GAUSSIAN_TEST['coverage_50'] - 0.5) * 100,
+       format_percentage(GAUSSIAN_TEST['coverage_95'])))
 add_paragraph(
     'The Student-t likelihood improves calibration substantially but does not fix it. Coverage of '
     'the nominal 50 percent interval falls from %s to %s and the mean width from %.2f to %.2f '
-    'percentage points, yet %s against a nominal 50 percent is still severely miscalibrated, '
-    'covering roughly %.1f times the intended fraction of observations. This is a partial '
+    'percentage points, yet %s against a nominal 50 percent is still severely miscalibrated: '
+    'coverage is %.1f percentage points above the nominal 50 percent level. This is a partial '
     'improvement, not a repair, and the residual miscalibration is consistent with the '
     'diagnostics of Section 6.4: a Student-t with a single scale still assumes one noise level '
     'for every machine and every time, whereas the data are heteroscedastic across machines, as '
@@ -1217,7 +1352,8 @@ add_paragraph(
     % (format_percentage(GAUSSIAN_TEST['coverage_50']),
        format_percentage(STUDENT_TEST['coverage_50']),
        GAUSSIAN_TEST['width_50_percentage_points'], STUDENT_TEST['width_50_percentage_points'],
-       format_percentage(STUDENT_TEST['coverage_50']), STUDENT_TEST['coverage_50'] / 0.5))
+       format_percentage(STUDENT_TEST['coverage_50']),
+       (STUDENT_TEST['coverage_50'] - 0.5) * 100))
 add_paragraph(
     'A useful check confirms that the cause lies in the likelihood rather than in the sampler or '
     'the priors: the same over-coverage appears when intervals are built from an ordinary '
@@ -1229,8 +1365,9 @@ add_figure('fig_calibration.png',
            'Two bar charts comparing Gaussian and Student-t likelihoods, showing coverage well '
            'above nominal for both and much narrower intervals under the Student-t.')
 add_figure('fig_predictions.png',
-           'One-step-ahead forecasts on the test split in original units, with the 95 percent '
-           'posterior predictive interval.',
+           'One-step-ahead forecasts in original units, with the 95 percent posterior predictive '
+           'interval, for the first %d of the %s test observations.'
+           % (250, thousands(data_summary['n_test'])),
            'A time-series chart comparing actual and predicted CPU utilisation with a shaded '
            'predictive interval that is visibly wider than the typical prediction error.')
 
@@ -1251,10 +1388,13 @@ add_paragraph(
        thousands(configuration['long_run_draws']), geometry['condition_number']))
 add_paragraph(
     'RQ2. Among the samplers that converge at the standard run length, Gibbs is the most '
-    'efficient both per second and per draw in this conjugate setting. HMC produces nearly '
-    'uncorrelated draws but pays for L gradient evaluations per iteration, and the sensitivity '
-    'grid shows its efficiency per gradient depends jointly on step size and trajectory length, '
-    'with the best configuration not the one with the highest acceptance rate.')
+    'efficient both per second and per draw in this conjugate setting, at %.3f worst-case bulk '
+    'ESS per retained draw. HMC converges under the selected configuration, but its worst-case '
+    'ESS is %.3f per retained draw, substantially below Gibbs, and it also pays for L gradient '
+    'evaluations per iteration. The sensitivity grid shows its efficiency per gradient depends '
+    'jointly on step size and trajectory length, with the best-performing configuration not the '
+    'one with the highest acceptance rate.'
+    % (ESS_PER_DRAW['Gibbs'], ESS_PER_DRAW['HMC']))
 add_paragraph(
     'RQ3. The intervals are not calibrated. A Gaussian likelihood produces nominal 50 percent '
     'intervals covering %s, because heavy-tailed residuals inflate the single noise parameter. A '
@@ -1276,8 +1416,12 @@ add_bullet('Preconditioned Metropolis: keeps the generality of Metropolis while 
 add_bullet('Gibbs: no tuning, exact conditionals, insensitive to the starting point, and the '
            'fastest here. It requires closed-form conditionals, which exist only because of the '
            'prior structure chosen, so it does not generalise to most realistic models.')
-add_bullet('Hamiltonian Monte Carlo: near-independent draws and the best scaling to higher '
-           'dimensions, at the cost of a differentiable log posterior and two tuning parameters.')
+add_bullet('Hamiltonian Monte Carlo: converges reliably and is expected to scale better to '
+           'higher dimensions than a random walk, at the cost of a differentiable log posterior '
+           'and two tuning parameters. On this posterior its worst-case ESS is %.3f per retained '
+           'draw, well below the %.3f achieved by Gibbs, so the conjugate structure that Gibbs '
+           'exploits is worth more here than gradient information.'
+           % (ESS_PER_DRAW['HMC'], ESS_PER_DRAW['Gibbs']))
 add_paragraph('Limitations.', bold=True)
 add_bullet('The model is linear and pools all machines under one coefficient vector, which '
            'Section 3.5 shows is only approximately right.')
@@ -1307,29 +1451,32 @@ add_bullet('On this posterior, Gibbs sampling and Hamiltonian Monte Carlo conver
               samplers['MH']['worst_rhat'], samplers['Adaptive MH (naive)']['worst_rhat']))
 add_bullet('The failure is explained by posterior anisotropy, condition number %.0f, caused by '
            'near-collinear lag features. Preconditioning with the observed Fisher information '
-           'raises bulk ESS from %.1f to %.0f at negligible cost.'
-           % (geometry['condition_number'], samplers['MH']['min_bulk_ess'],
-              samplers['Preconditioned MH']['min_bulk_ess']))
+           'repairs the geometry at negligible cost: extended to %s draws per chain it converges '
+           'and reaches bulk ESS %.0f, against %.1f for plain Metropolis.'
+           % (geometry['condition_number'], thousands(configuration['long_run_draws']),
+              long_run['min_bulk_ess'], samplers['MH']['min_bulk_ess']))
 add_bullet('Estimating the proposal covariance from the chain itself failed under the '
            'configuration tested, collapsing acceptance to %s. This is a property of the '
            'burn-in budget and initial proposal, not a general property of adaptive Metropolis.'
            % format_percentage(samplers['Adaptive MH (naive)']['acceptance_rate']))
 if BEST_HMC_CELL:
     add_bullet('For HMC, efficiency per gradient evaluation depends on step size and trajectory '
-               'length jointly. The best converged configuration, epsilon = %.3f with L = %d, has '
-               'an acceptance rate of %s, lower than several less efficient settings, so a high '
-               'acceptance rate is not by itself evidence of good tuning.'
+               'length jointly. The best-performing configuration among those meeting the '
+               'warm-start diagnostic thresholds, epsilon = %.3f with L = %d, has an acceptance '
+               'rate of %s, lower than several less efficient settings, so a high acceptance '
+               'rate is not by itself evidence of good tuning.'
                % (BEST_HMC_CELL['step_size'], BEST_HMC_CELL['leapfrog_steps'],
                   format_percentage(BEST_HMC_CELL['acceptance'])))
 add_bullet('Posterior predictive intervals from a Gaussian likelihood are badly miscalibrated, a '
            'nominal 50 percent interval covering %s, because test residuals have excess kurtosis '
            '%.0f. A Student-t likelihood chosen on validation data improves this to %s and '
-           'reduces the median absolute error from %.3f to %.3f percentage points, but the '
-           'intervals remain substantially wider than nominal.'
+           'reduces the median absolute error from %.3f to %.3f percentage points, though '
+           'coverage remains %.1f percentage points above the nominal level.'
            % (format_percentage(GAUSSIAN_TEST['coverage_50']), residuals['excess_kurtosis'],
               format_percentage(STUDENT_TEST['coverage_50']),
               GAUSSIAN_TEST['median_absolute_error_percentage_points'],
-              STUDENT_TEST['median_absolute_error_percentage_points']))
+              STUDENT_TEST['median_absolute_error_percentage_points'],
+              (STUDENT_TEST['coverage_50'] - 0.5) * 100))
 add_paragraph('Further work.', bold=True)
 add_bullet('Place a prior on nu and sample it, rather than selecting from a grid whose edge is '
            'chosen.')
@@ -1361,14 +1508,17 @@ add_table('Repository contents.',
           [('src/run_experiment_v2.py', 'All samplers, diagnostics, references, studies, figures'),
            ('src/mcmc_diagnostics.py', 'Rank-normalised R-hat and bulk/tail ESS, from scratch'),
            ('src/create_report_v2.py', 'Generates this document from the results file'),
+           ('src/finalise_document.ps1', 'Evaluates the contents field and exports a PDF'),
            ('results/experiment_results_v2.json', 'Every number appearing in this document'),
            ('results/figures/', 'All figures'),
            ('notebooks/', 'Annotated notebook'),
            ('data/', 'Not committed; see data/README.md for the download link and layout')],
           column_widths_cm=[6.0, 9.4])
-add_paragraph('The pipeline is reproduced with two commands:')
+add_paragraph('The pipeline is reproduced with two commands, plus an optional third that asks '
+              'Word to evaluate the table-of-contents field and export a PDF:')
 add_code_block(['python src/run_experiment_v2.py --skip-nuts',
-                'python src/create_report_v2.py'])
+                'python src/create_report_v2.py',
+                'powershell -File src/finalise_document.ps1'])
 add_paragraph(
     'The Bitbrains traces are not committed: the fastStorage directory is 1.19 GB across 1,250 '
     'files and is published by its authors %s. The --skip-nuts flag omits an optional PyMC '
@@ -1377,6 +1527,7 @@ add_paragraph(
     % cite('shen2015'))
 
 add_page_numbers()
+request_field_update_on_open()
 os.makedirs(DOCUMENT_DIRECTORY, exist_ok=True)
 document.save(OUTPUT_FILE)
 
